@@ -492,11 +492,11 @@ async function askKiru(senderNum, userMessage, opts = {}) {
 
 // Fallback replies when API is down / quota exceeded
 const KIRU_FALLBACKS = [
-  'yaar abhi thodi busy hun 😭 baad mein baat karte hain!',
-  'uff net slow hai mera 😩 ek sec',
-  'arey ruk yaar 🙄 kuch hua hai connection mein',
+  'no',
+  'samaj ni aya bhai',
+  'ruk mai ati hu',
   'hmm? sorry yaar distract ho gayi thi 🤭',
-  'bhai abhi nahi please 😤 baad mein'
+  'accha???'
 ];
 
 // ===== STICKER DB =====
