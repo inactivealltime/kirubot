@@ -209,9 +209,22 @@ function generateSentence() {
   return `${subject} ${verb} ${object}`
 }
 
+// ── FIXED: Format large coin amounts as K / M / B ──────────────────────────
 function formatCowoncy(num) {
-  if (num >= 1000) return (num/1000).toFixed(1) + "k"
-  return num.toString()
+  if (typeof num !== 'number') num = Number(num) || 0;
+  if (num >= 1_000_000_000) {
+    const v = num / 1_000_000_000;
+    return (Number.isInteger(v) ? v : v.toFixed(2).replace(/\.?0+$/, '')) + 'B';
+  }
+  if (num >= 1_000_000) {
+    const v = num / 1_000_000;
+    return (Number.isInteger(v) ? v : v.toFixed(2).replace(/\.?0+$/, '')) + 'M';
+  }
+  if (num >= 1_000) {
+    const v = num / 1_000;
+    return (Number.isInteger(v) ? v : v.toFixed(1).replace(/\.0$/, '')) + 'K';
+  }
+  return num.toString();
 }
 
 function shuffleWord(word) {
@@ -222,14 +235,28 @@ function shuffleWord(word) {
   return shuffled
 }
 
-function loadOwo() {
-  if (!fs.existsSync(OWO_FILE)) fs.writeFileSync(OWO_FILE, "{}")
-  return JSON.parse(fs.readFileSync(OWO_FILE))
+// ── IN-MEMORY DB — loaded once at startup, all commands use owoDb directly ──
+// This eliminates ALL race conditions from the old loadOwo()/saveOwo(data) pattern.
+let owoDb = {};
+
+function initOwoDb() {
+  if (!fs.existsSync(OWO_FILE)) fs.writeFileSync(OWO_FILE, '{}');
+  try { owoDb = JSON.parse(fs.readFileSync(OWO_FILE, 'utf8')); }
+  catch (e) { console.error('⚠️ owo_db.json damaged, starting fresh:', e.message); owoDb = {}; }
 }
 
-function saveOwo(data) {
-  fs.writeFileSync(OWO_FILE, JSON.stringify(data, null, 2))
+// Debounced disk write — fires 800ms after last saveOwo() call
+let _owoSaveTimer = null;
+function saveOwo() {
+  if (_owoSaveTimer) clearTimeout(_owoSaveTimer);
+  _owoSaveTimer = setTimeout(() => {
+    try { fs.writeFileSync(OWO_FILE, JSON.stringify(owoDb, null, 2)); }
+    catch (e) { console.error('❌ Failed to save owo_db.json:', e.message); }
+  }, 800);
 }
+
+// Initialise DB immediately (replaces the old per-command loadOwo() calls)
+initOwoDb();
 
 // ===== KIRU AI PERSONALITY =====
 
@@ -282,7 +309,7 @@ REPLY STYLE:
 - No bullet points, no numbered lists, no formatting
 
 EMOJIS: use 0-1 emoji mostly. Sometimes none. Rarely 2.
-Pick from: 💀😭🐽������������🖕🔥🤭✨💅❤️🫡
+Pick from: 💀😭🐽🫦🤌🏼💋🖕🔥🤭✨💅❤️🫡
 
 COMMON WORDS:
 yaar, bro, wtf, lmao, fr, ngl, ew, real., nahhh, wild, cry about it, pagal hai kya, brooo, delulu, skill issue, cooked, side eye, simp mat ban, canon event
@@ -365,6 +392,35 @@ try {
 } catch {}
 function saveKiruMemory() {
   try { fs.writeFileSync(KIRU_MEMORY_FILE, JSON.stringify(kiruMemory)); } catch {}
+}
+
+// ── User message corpus — save real user lines, use in Kiru personality ──
+const USER_CORPUS_FILE = 'user_corpus.json';
+let userCorpus = [];          // flat array of strings
+const USER_CORPUS_MAX = 600;  // keep last 600 unique-ish lines
+try {
+  if (fs.existsSync(USER_CORPUS_FILE)) {
+    userCorpus = JSON.parse(fs.readFileSync(USER_CORPUS_FILE, 'utf8'));
+    if (!Array.isArray(userCorpus)) userCorpus = [];
+  }
+} catch {}
+let _corpusDirty = false;
+function saveUserCorpus() {
+  try { fs.writeFileSync(USER_CORPUS_FILE, JSON.stringify(userCorpus)); _corpusDirty = false; } catch {}
+}
+// Periodic flush every 60 s so we don't hit disk on every message
+setInterval(() => { if (_corpusDirty) saveUserCorpus(); }, 60_000);
+function addToCorpus(line) {
+  const clean = line.trim();
+  if (!clean || clean.length < 4 || clean.length > 200) return;
+  if (userCorpus[userCorpus.length - 1] === clean) return; // dedupe consecutive same
+  userCorpus.push(clean);
+  if (userCorpus.length > USER_CORPUS_MAX) userCorpus.splice(0, userCorpus.length - USER_CORPUS_MAX);
+  _corpusDirty = true;
+}
+function randCorpusLine() {
+  if (userCorpus.length === 0) return null;
+  return userCorpus[Math.floor(Math.random() * userCorpus.length)];
 }
 
 async function askKiru(senderNum, userMessage, opts = {}) {
@@ -534,12 +590,17 @@ function savePrefix(newPrefix) {
   fs.writeFileSync(PREFIX_FILE, JSON.stringify({ prefix: newPrefix }, null, 2));
 }
 
+// ---------- Broadcast Session (owner only, in-memory) ----------
+// ownerNum -> { messages: [ {type, payload} ], dmUsers: Set }
+const broadcastSession = {};
+
 // ---------- Persisted Runtime State ----------
 let state = {
   chatStates: {},
   adminNumber: null,
   globalSubadmins: [],
-  botNumber: null
+  botNumber: null,
+  botEnabled: true     // /kiru on / /kiru off
 };
 
 function sanitizeState() {
@@ -568,6 +629,7 @@ function loadState() {
   }
   if (!state.adminNumber) state.adminNumber = null;
   if (!Array.isArray(state.globalSubadmins)) state.globalSubadmins = [];
+  if (state.botEnabled === undefined) state.botEnabled = true;
   sanitizeState();
 }
 
@@ -642,10 +704,11 @@ const BASE_COMMANDS = [
   'war', 'accept',
   'fine', 'transfer',
   'data', 'setsticker', 'clearstickers', 'addbotsticker', 'clearbotsticker',
+  'kiru', 'broadcast', 'done',
 ];
 
 // Bot owner only commands
-const BOT_OWNER_CMDS = new Set(['admin','addbot','hy','dynamicstop','co','removeco','reset','changeprefix','data','setsticker','clearstickers']);
+const BOT_OWNER_CMDS = new Set(['admin','addbot','hy','dynamicstop','co','removeco','reset','changeprefix','data','setsticker','clearstickers','kiru','broadcast','done']);
 // Group admin OR bot owner commands
 const GROUP_ADMIN_CMDS = new Set(['kick','add','promote','demote','tagall','lock','unlock','disband','antilink','antibad','addbadword','removebadword','listbadwords','mute','unmute','mutelists','gcjoin']);
 
@@ -1127,8 +1190,6 @@ async function onMessage({ messages, type }) {
   if (!isConnected || !messages || !Array.isArray(messages) || messages.length === 0) return;
 
   // Track bot's OWN sent message IDs BEFORE the 'notify' filter.
-  // Baileys delivers bot-sent messages as type='append', which the filter below drops.
-  // Without this, botSentIds stays empty and stanzaId-based quoted-reply detection never works.
   for (const m of messages) {
     if (m.key?.fromMe && m.key?.id) {
       botSentIds.add(m.key.id);
@@ -1161,6 +1222,83 @@ async function onMessage({ messages, type }) {
   const isCmd = isCommand(text);
   const args = text.split(" ").slice(1);
 
+  // ── Track known DM users (for broadcast) ──────────────────────────────────
+  if (!isGroup && !fromSelf && senderNum) {
+    if (!state.knownDmUsers) state.knownDmUsers = [];
+    if (!state.knownDmUsers.includes(senderNum)) {
+      state.knownDmUsers.push(senderNum);
+      // No need to save immediately — next saveState() will persist it
+    }
+  }
+
+  // ── GLOBAL BOT OFF — ignore everyone except owner ──────────────────────────
+  // Allow /kiru on even when bot is off so owner can re-enable
+  if (state.botEnabled === false && !fromSelf) {
+    const senderIsOwner = isTheAdmin(senderNum);
+    if (!senderIsOwner) return; // ignore completely
+    // Owner can only use /kiru on when bot is off
+    const rawCmdOff = text.slice(dynamicPrefix.length).trim().toLowerCase();
+    if (!rawCmdOff.startsWith('kiru on')) return;
+  }
+
+  // ── BROADCAST CAPTURE — if owner has an active session, capture their messages ─
+  if (!fromSelf && isTheAdmin(senderNum) && broadcastSession[senderNum]) {
+    const session = broadcastSession[senderNum];
+    const rawTxt = text.trim().toLowerCase();
+    // /done ends the session and sends — handled below in command processing
+    if (rawTxt !== `${dynamicPrefix}done` && rawTxt !== 'done') {
+      // Capture any message type
+      const m = msg.message;
+      if (m.conversation || m.extendedTextMessage) {
+        session.messages.push({ type: 'text', payload: text });
+      } else if (m.imageMessage) {
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: sock.updateMediaMessage
+          });
+          session.messages.push({ type: 'image', payload: buf, caption: m.imageMessage.caption || '' });
+        } catch {}
+      } else if (m.videoMessage) {
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: sock.updateMediaMessage
+          });
+          session.messages.push({ type: 'video', payload: buf, caption: m.videoMessage.caption || '', gifPlayback: !!m.videoMessage.gifPlayback });
+        } catch {}
+      } else if (m.stickerMessage) {
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: sock.updateMediaMessage
+          });
+          session.messages.push({ type: 'sticker', payload: buf });
+        } catch {}
+      } else if (m.audioMessage) {
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: sock.updateMediaMessage
+          });
+          session.messages.push({ type: 'audio', payload: buf, ptt: !!m.audioMessage.ptt });
+        } catch {}
+      } else if (m.documentMessage) {
+        try {
+          const buf = await downloadMediaMessage(msg, 'buffer', {}, {
+            logger: pino({ level: 'silent' }),
+            reuploadRequest: sock.updateMediaMessage
+          });
+          session.messages.push({ type: 'document', payload: buf, fileName: m.documentMessage.fileName || 'file', mimetype: m.documentMessage.mimetype || 'application/octet-stream' });
+        } catch {}
+      }
+      const cnt = session.messages.length;
+      await reply(msg, `✅ *${cnt} message${cnt > 1 ? 's' : ''} captured*\n\n_Add more messages ya ${dynamicPrefix}done bhejo broadcast karne ke liye_`);
+      return;
+    }
+    // If /done — fall through to command processing below
+  }
+
   // =====================
   // MATH GAME ANSWER CHECK
   // =====================
@@ -1168,11 +1306,13 @@ async function onMessage({ messages, type }) {
     const game = mathGames[chatId];
     const num = parseInt(text);
     if (!isNaN(num) && num === game.answer) {
-      const db = loadOwo();
-      getUser(db, senderNum);
-      db[senderNum].cash += game.reward;
-      saveOwo(db);
-      await sock.sendMessage(chatId, { text: `🎉 Correct!\n\n@${senderNum} +💰${game.reward} coins`, mentions: [senderJid] });
+      getUser(owoDb, senderNum);
+      owoDb[senderNum].cash += game.reward;
+      saveOwo();
+      await sock.sendMessage(chatId, {
+        text: `🎉 *CORRECT!*\n\n@${senderNum} ne sahi jawab diya!\n\n💰 *+${game.reward} coins*\n🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+        mentions: [senderJid]
+      });
       delete mathGames[chatId];
       return;
     }
@@ -1185,11 +1325,13 @@ async function onMessage({ messages, type }) {
     const game = duelGames[chatId];
     const elapsed = Date.now() - game.startTime;
     if (text.trim().toLowerCase() === game.sentence.toLowerCase() && elapsed >= game.minTime) {
-      const db = loadOwo();
-      getUser(db, senderNum);
-      db[senderNum].cash += game.reward;
-      saveOwo(db);
-      await sock.sendMessage(chatId, { text: `🏆 @${senderNum} wins the typing race!\n\n+💰${game.reward} coins\n⚡ Time: ${(elapsed/1000).toFixed(2)}s`, mentions: [senderJid] });
+      getUser(owoDb, senderNum);
+      owoDb[senderNum].cash += game.reward;
+      saveOwo();
+      await sock.sendMessage(chatId, {
+        text: `🏆 *TYPING RACE WON!*\n\n@${senderNum} wins!\n\n⚡ Time: *${(elapsed/1000).toFixed(2)}s*\n💰 *+${game.reward} coins*\n🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+        mentions: [senderJid]
+      });
       delete duelGames[chatId];
       return;
     }
@@ -1201,11 +1343,13 @@ async function onMessage({ messages, type }) {
   if (scrambleGames[chatId]) {
     const game = scrambleGames[chatId];
     if (text.trim().toLowerCase() === game.word.toLowerCase()) {
-      const db = loadOwo();
-      getUser(db, senderNum);
-      db[senderNum].cash += game.reward;
-      saveOwo(db);
-      await sock.sendMessage(chatId, { text: `🎉 @${senderNum} unscrambled it!\n\nWord: *${game.word}*\n+💰${game.reward} coins`, mentions: [senderJid] });
+      getUser(owoDb, senderNum);
+      owoDb[senderNum].cash += game.reward;
+      saveOwo();
+      await sock.sendMessage(chatId, {
+        text: `🎉 *UNSCRAMBLED!*\n\n@${senderNum} ne guess kar liya!\n\n✅ Word: *${game.word}*\n💰 *+${game.reward} coins*\n🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+        mentions: [senderJid]
+      });
       delete scrambleGames[chatId];
       return;
     }
@@ -1218,11 +1362,13 @@ async function onMessage({ messages, type }) {
     const game = guessGames[chatId];
     const num = parseInt(text);
     if (!isNaN(num) && num === game.number) {
-      const db = loadOwo();
-      getUser(db, senderNum);
-      db[senderNum].cash += game.reward;
-      saveOwo(db);
-      await sock.sendMessage(chatId, { text: `🎉 @${senderNum} guessed the number!\n\nNumber: ${game.number}\n+💰${game.reward} coins`, mentions: [senderJid] });
+      getUser(owoDb, senderNum);
+      owoDb[senderNum].cash += game.reward;
+      saveOwo();
+      await sock.sendMessage(chatId, {
+        text: `🎉 *CORRECT GUESS!*\n\n@${senderNum} ne number pakad liya!\n\n🔢 Number was: *${game.number}*\n💰 *+${game.reward} coins*\n🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+        mentions: [senderJid]
+      });
       delete guessGames[chatId];
       return;
     }
@@ -1234,11 +1380,13 @@ async function onMessage({ messages, type }) {
   if (emojiGames[chatId]) {
     const game = emojiGames[chatId];
     if (text.trim().toLowerCase() === game.answer) {
-      const db = loadOwo();
-      getUser(db, senderNum);
-      db[senderNum].cash += game.reward;
-      saveOwo(db);
-      await sock.sendMessage(chatId, { text: `🎉 @${senderNum} got it!\n\nAnswer: ${game.answer}\n+💰${game.reward} coins`, mentions: [senderJid] });
+      getUser(owoDb, senderNum);
+      owoDb[senderNum].cash += game.reward;
+      saveOwo();
+      await sock.sendMessage(chatId, {
+        text: `🎉 *EMOJI SOLVED!*\n\n@${senderNum} ne sahi answer diya!\n\n✅ Answer: *${game.answer}*\n💰 *+${game.reward} coins*\n🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+        mentions: [senderJid]
+      });
       delete emojiGames[chatId];
       return;
     }
@@ -1327,7 +1475,6 @@ async function onMessage({ messages, type }) {
       await sock.sendMessage(chatId, { text: randItem(forgivenMsgs), mentions: [senderJid] });
       return;
     } else {
-      // Remind them they need to apologize
       await sock.sendMessage(chatId, { delete: msg.key });
       return;
     }
@@ -1352,17 +1499,17 @@ async function onMessage({ messages, type }) {
   // ============================================================
   // KIRU AI — triggered by name mention OR quoted reply to bot
   // ============================================================
-  if (!fromSelf && !isCmd && text.length > 0) {
+  // ── Save non-command user messages to corpus ────────────────────────────
+  if (!fromSelf && !isCmd && text.length >= 4 && text.length <= 200 && !isTheAdmin(senderNum)) {
+    addToCorpus(text);
+  }
+
+  if (!fromSelf && !isCmd && (text.length > 0 || msg.message?.stickerMessage || msg.message?.imageMessage)) {
     const lowerText = text.toLowerCase();
 
     // Check if someone mentioned "kiru" in the message
     const mentionsKiru = /\bkiru\b/i.test(lowerText);
 
-    // ── Detect reply-to-bot via stanzaId ─────────────────────────────
-    // WhatsApp now uses @lid (Linked Device IDs) instead of phone numbers
-    // in contextInfo.participant, so phone-number comparison breaks.
-    // Instead we track every message the bot sends (botSentIds) and check
-    // if the quoted message's stanzaId is one of ours.
     const quotedCtx =
       msg.message?.extendedTextMessage?.contextInfo ||
       msg.message?.imageMessage?.contextInfo ||
@@ -1373,13 +1520,11 @@ async function onMessage({ messages, type }) {
 
     const isReplyToBot = !!(quotedCtx?.stanzaId && botSentIds.has(quotedCtx.stanzaId));
 
-    // Debug log — shows in terminal when someone sends a quoted reply
     if (quotedCtx?.stanzaId) {
       __orig_log(`🔍 [QuotedReply] stanzaId=${quotedCtx.stanzaId} | inBotIds=${botSentIds.has(quotedCtx.stanzaId)} | botSentIds.size=${botSentIds.size}`);
     }
 
     // ── VOICE MODERATION — owner/admin tells bot to kick/mute/unmute ──────
-    // Works when bot is admin. Detects natural Hinglish commands.
     if (isGroup && isBotAdmin && (senderIsAdmin || isAdmin)) {
       const lc = lowerText;
       const wantsKick   = /\b(kick|nikal|bahar\s*kar|hata\s*de|nikaal)\b/i.test(lc);
@@ -1420,7 +1565,6 @@ async function onMessage({ messages, type }) {
           }
           if (wantsUnmute) {
             if (botAutoMuted[chatId]?.has(targetNum)) {
-              // Bot had auto-muted them — require apology
               pendingApology[chatId] = pendingApology[chatId] || {};
               pendingApology[chatId][targetNum] = { requesterJid: senderJid };
               await sock.sendMessage(chatId, { text: randItem([
@@ -1485,51 +1629,49 @@ async function onMessage({ messages, type }) {
     }
 
     // ── CHALLENGE DETECTION — Kiru strikes back when challenged ─────────────
-    const challengeRx = /\b(aukat|kar\s*le|kya\s*kare\s*gi|kya\s*kar\s*le\s*gi|kuch\s*nahi\s*kar\s*sakti|hath\s*nahi\s*lagti|dekh\s*lena|dare\s*hai|dare\s*karo|lay\s*toh|lelo\s*toh|kr\s*ke\s*dikha)\b/i;
-    if (isGroup && mentionsKiru && challengeRx.test(lowerText) && !senderIsAdmin && !isAdmin) {
-      const dbChallenge = loadOwo();
-      getUser(dbChallenge, senderNum);
-      let challengeActionMsg = null;
-      if (dbChallenge[senderNum].cash > 200) {
-        const stealPct = 0.10 + Math.random() * 0.25;
-        const stolen = Math.floor(dbChallenge[senderNum].cash * stealPct);
-        dbChallenge[senderNum].cash = Math.max(0, dbChallenge[senderNum].cash - stolen);
-        saveOwo(dbChallenge);
-        challengeActionMsg = randItem([
-          `btw tune jo challenge kiya... *${stolen} coins* le li tere wallet se 😏💸`,
-          `aur haan — *${stolen} coins* gayab 💀 yeh toh sirf trailer tha`,
-          `oh nice *${stolen} coins* tere se chali 😌 next baar mat bolna`
-        ]);
+    const challengeWords = /\b(challenge|bet|dare|lagao|laga|kitne|harao|haar|jeeto|jeet)\b/i;
+    const isChallengeMsg = mentionsKiru && challengeWords.test(lowerText) && !senderIsAdmin;
+    let challengeActionMsg = null;
+    if (isChallengeMsg && isGroup) {
+      const action = Math.random();
+      if (action < 0.4) {
+        getUser(owoDb, senderNum);
+        const stolen = Math.floor(Math.random() * 50) + 10;
+        if (owoDb[senderNum].cash >= stolen) {
+          owoDb[senderNum].cash -= stolen;
+          saveOwo();
+          challengeActionMsg = randItem([
+            `btw tune jo challenge kiya... *${stolen} coins* le li tere wallet se 😏💸`,
+            `aur haan — *${stolen} coins* gayab 💀 yeh toh sirf trailer tha`,
+            `oh nice *${stolen} coins* tere se chali 😌 next baar mat bolna`
+          ]);
+        }
       }
-      try {
-        await sock.sendPresenceUpdate('composing', chatId);
-        await new Promise(r => setTimeout(r, 800 + Math.random() * 1000));
-        const kiruReply = await askKiru(senderNum, text);
-        const finalReply = kiruReply || randItem(KIRU_FALLBACKS);
-        await sock.sendMessage(chatId, { text: finalReply }, { quoted: msg });
-      } catch {}
-      if (challengeActionMsg) {
-        await new Promise(r => setTimeout(r, 1200));
-        await sock.sendMessage(chatId, { text: challengeActionMsg, mentions: [senderJid] });
-      }
-      return;
     }
-
-    // In DM: reply to ALL messages (no need for kiru mention or quoted reply)
+    // ── Detect message type & trigger context ───────────────────────────────
     const isDM = !isGroup;
-
-    // Detect if message is a sticker (so Kiru can respond to its vibe)
     const isStickerMsg = !!(msg.message?.stickerMessage);
-    const isOwnerMsg = isTheAdmin(senderNum);
+    const isImageMsg   = !!(msg.message?.imageMessage);
+    const isOwnerMsg   = isTheAdmin(senderNum);
 
-    if (mentionsKiru || isReplyToBot || isDM || isStickerMsg) {
+    if (mentionsKiru || isReplyToBot || isDM || isStickerMsg || isImageMsg) {
       try {
         // Build contextual message for Kiru
         let msgForKiru = text;
         if (isStickerMsg && !text) {
-          msgForKiru = '[User ne sticker bheja - iska vibe match karo, short casual reply karo]';
+          msgForKiru = '[User ne sticker bheja - iska vibe aur emoji feel samjho, short casual chill reply do]';
         } else if (isStickerMsg && text) {
           msgForKiru = `[User ne sticker ke saath yeh likha]: ${text}`;
+        } else if (isImageMsg && !text) {
+          msgForKiru = '[User ne ek image bheja - natural casual react karo jaise dost karta hai]';
+        } else if (isImageMsg && text) {
+          msgForKiru = `[User ne image ke saath yeh likha]: ${text}`;
+        }
+
+        // Occasionally inject a real saved user line for extra flavor (15% chance)
+        if (userCorpus.length > 20 && Math.random() < 0.15) {
+          const cl = randCorpusLine();
+          if (cl) msgForKiru += `\n[Group mein kisi ne pehle kaha tha: "${cl}" — agar relevant lage toh use karo apni reply mein]`;
         }
 
         await sock.sendPresenceUpdate('composing', chatId);
@@ -1538,27 +1680,41 @@ async function onMessage({ messages, type }) {
         const finalReply = kiruReply || randItem(KIRU_FALLBACKS);
         await sock.sendMessage(chatId, { text: finalReply }, { quoted: msg });
 
-        // ── Mood-based auto sticker: send after every 5-6 messages ──────
+        // ── Sticker-for-sticker: someone sends sticker → Kiru sends one back ──
+        if (isStickerMsg) {
+          await new Promise(r => setTimeout(r, 600 + Math.random() * 400));
+          try {
+            const sDbS = loadStickerDb();
+            const allSlots = [...(sDbS.happy || []), ...(sDbS.sad || []), ...(sDbS.roast || [])];
+            if (allSlots.length > 0) {
+              const chosen = randItem(allSlots);
+              const fp = path.join(__dirname, 'stickers', chosen.file);
+              if (fs.existsSync(fp)) {
+                const mediaBuf = fs.readFileSync(fp);
+                if (chosen.type === 'sticker') await sock.sendMessage(chatId, { sticker: mediaBuf });
+                else if (chosen.type === 'video') await sock.sendMessage(chatId, { video: mediaBuf, gifPlayback: true });
+                else await sock.sendMessage(chatId, { image: mediaBuf });
+              }
+            }
+          } catch {}
+        }
+
+        // ── Mood-based auto sticker: send after every 5-6 non-sticker messages ──
         if (!kiruStickerCounter[chatId]) kiruStickerCounter[chatId] = 0;
         kiruStickerCounter[chatId]++;
-        const stickerThreshold = 5 + Math.floor(Math.random() * 2); // 5 or 6
-        if (kiruStickerCounter[chatId] >= stickerThreshold) {
+        const stickerThreshold = 5 + Math.floor(Math.random() * 2);
+        if (!isStickerMsg && kiruStickerCounter[chatId] >= stickerThreshold) {
           kiruStickerCounter[chatId] = 0;
           try {
             const sDbKiru = loadStickerDb();
-            // Detect mood from recent message text
             const recentText = (msgForKiru + ' ' + (finalReply || '')).toLowerCase();
             const isHappy = /lol|lmao|haha|hehe|mast|acha|nice|love|❤|😂|😄|🔥|great|wow|yay|khush|happy/.test(recentText);
-            const isSad = /sad|miss|cry|😢|rona|dukh|lonely|bura|hurt|upset|sorry|\:\(/.test(recentText);
+            const isSad   = /sad|miss|cry|😢|rona|dukh|lonely|bura|hurt|upset|sorry|\:\(/.test(recentText);
             const isRoast = /💀|roast|burn|savage|lodu|chup|nikal|aukaat|bakchodi|idiot|stupid|mad/.test(recentText);
-
-            let moodCategory = 'happy'; // default
+            let moodCategory = 'happy';
             if (isSad) moodCategory = 'sad';
             else if (isRoast) moodCategory = 'roast';
-
-            // Try mood category first, fallback to others
             const cats = [moodCategory, 'happy', 'sad', 'roast'];
-            let sent = false;
             for (const cat of cats) {
               const pool = sDbKiru[cat] || [];
               if (pool.length > 0) {
@@ -1569,12 +1725,17 @@ async function onMessage({ messages, type }) {
                   if (chosen.type === 'sticker') await sock.sendMessage(chatId, { sticker: mediaBuf });
                   else if (chosen.type === 'video') await sock.sendMessage(chatId, { video: mediaBuf, gifPlayback: chosen.gifPlayback === true });
                   else await sock.sendMessage(chatId, { image: mediaBuf });
-                  sent = true;
                   break;
                 }
               }
             }
           } catch {}
+        }
+
+        // ── Challenge action (coin steal) ─────────────────────────────────────
+        if (challengeActionMsg) {
+          await new Promise(r => setTimeout(r, 1200));
+          await sock.sendMessage(chatId, { text: challengeActionMsg, mentions: [senderJid] });
         }
       } catch (e) {
         console.error('Kiru AI error:', e.message);
@@ -1688,11 +1849,21 @@ async function onMessage({ messages, type }) {
         }
 
         case 'ping': {
-          const os = require('os');
           const start = Date.now();
           const sent = await sock.sendMessage(chatId, { text: '🏓 _Pinging..._' }, { quoted: msg });
           const latency = Date.now() - start;
-          const pingText = `🏓 PONG!\n\n⚡ Latency: *${latency} ms*\n🤖 Bot Uptime: *${formatUptime(process.uptime() * 1000)}*\n🧠 RAM: *${(process.memoryUsage().rss / 1024 / 1024).toFixed(1)} MB*\n📡 Status: *ONLINE*\n👑 Admin: *${state.adminNumber ? '+' + state.adminNumber : 'NOT SET'}*\n📜 Prefix: *${dynamicPrefix}*`;
+          const pingText = [
+            `╔══════════════════════╗`,
+            `║  🏓  𝗣𝗜𝗡𝗚  𝗥𝗘𝗦𝗨𝗟𝗧  🏓  ║`,
+            `╚══════════════════════╝`,
+            ``,
+            `⚡ Latency  : *${latency} ms*`,
+            `🤖 Uptime   : *${formatUptime(process.uptime() * 1000)}*`,
+            `🧠 RAM      : *${(process.memoryUsage().rss / 1024 / 1024).toFixed(1)} MB*`,
+            `📡 Status   : *🟢 ONLINE*`,
+            `👑 Admin    : *${state.adminNumber ? '+' + state.adminNumber : 'NOT SET'}*`,
+            `📜 Prefix   : *${dynamicPrefix}*`,
+          ].join('\n');
           await sock.sendMessage(chatId, { text: pingText }, { quoted: sent });
           break;
         }
@@ -1701,7 +1872,7 @@ async function onMessage({ messages, type }) {
           chatState.active = false;
           chatState.startedAt = null;
           saveState();
-          await reply(msg, `🟢 Stopped all activities in this group`);
+          await reply(msg, `🔴 Bot stopped in this group`);
           break;
 
         case 'changeprefix': {
@@ -1755,6 +1926,192 @@ async function onMessage({ messages, type }) {
           saveState();
           await reply(msg, `🔄 Bot state reset in ${isGroup ? 'group' : 'DM'}`);
           break;
+
+        // ============================================================
+        // /kiru on | /kiru off — global bot toggle (owner only)
+        // ============================================================
+        case 'kiru': {
+          const kiruArg = (arg || '').trim().toLowerCase();
+          if (kiruArg === 'on') {
+            state.botEnabled = true;
+            saveState();
+            await reply(msg, [
+              `╔══════════════════════╗`,
+              `║  🟢  𝗞𝗜𝗥𝗨  𝗕𝗢𝗧  𝗢𝗡  🟢  ║`,
+              `╚══════════════════════╝`,
+              ``,
+              `✅ Bot *globally enabled!*`,
+              ``,
+              `Sab commands aur AI replies wapas active hain.`,
+              `Sabko commands aur Kiru AI use kar sakte hain! 🎉`,
+            ].join('\n'));
+          } else if (kiruArg === 'off') {
+            state.botEnabled = false;
+            saveState();
+            await reply(msg, [
+              `╔══════════════════════╗`,
+              `║  🔴  𝗞𝗜𝗥𝗨  𝗕𝗢𝗧  𝗢𝗙𝗙  🔴  ║`,
+              `╚══════════════════════╝`,
+              ``,
+              `🔴 Bot *globally disabled!*`,
+              ``,
+              `Ab kisi ka bhi koi command ya AI reply nahi chalega.`,
+              `Sirf owner *${dynamicPrefix}kiru on* se wapas on kar sakta hai.`,
+            ].join('\n'));
+          } else {
+            const currentStatus = state.botEnabled !== false ? '🟢 ON' : '🔴 OFF';
+            await reply(msg, [
+              `⚙️ *KIRU BOT GLOBAL TOGGLE*`,
+              ``,
+              `Current Status: *${currentStatus}*`,
+              ``,
+              `*${dynamicPrefix}kiru on*  — bot globally enable karo`,
+              `*${dynamicPrefix}kiru off* — bot globally disable karo`,
+              ``,
+              `_Jab off ho, koi bhi command ya AI reply kaam nahi karega._`,
+              `_Sirf owner /kiru on use kar sakta hai._`,
+            ].join('\n'));
+          }
+          break;
+        }
+
+        // ============================================================
+        // /broadcast — start collecting messages for mass DM (owner DM only)
+        // ============================================================
+        case 'broadcast': {
+          if (isGroup) { await reply(msg, `❌ */broadcast* sirf bot ke DM mein use karo!`); break; }
+          if (broadcastSession[senderNum]) {
+            const cnt = broadcastSession[senderNum].messages.length;
+            await reply(msg, [
+              `⚠️ *Broadcast already active!*`,
+              ``,
+              `📦 Captured so far: *${cnt} message${cnt !== 1 ? 's' : ''}*`,
+              ``,
+              `Continue karo ya *${dynamicPrefix}done* bhejo broadcast karne ke liye.`,
+            ].join('\n'));
+            break;
+          }
+          broadcastSession[senderNum] = { messages: [] };
+          await reply(msg, [
+            `╔══════════════════════╗`,
+            `║  📢  𝗕𝗥𝗢𝗔𝗗𝗖𝗔𝗦𝗧  𝗦𝗧𝗔𝗥𝗧  📢  ║`,
+            `╚══════════════════════╝`,
+            ``,
+            `✅ *Broadcast session started!*`,
+            ``,
+            `Ab mujhe woh messages bhejo jo tum sab ko bhejna chahte ho:`,
+            `  • Text messages`,
+            `  • Images (with or without caption)`,
+            `  • Videos / GIFs`,
+            `  • Stickers`,
+            `  • Voice notes / Audio`,
+            `  • Documents`,
+            ``,
+            `Jab ho jao, *${dynamicPrefix}done* bhejo — main:`,
+            `  📢 Saare groups mein forward karungi`,
+            `  📩 Saare DM users ko bhi bheji gi`,
+            ``,
+            `_Cancel karne ke liye bas ignore karo — session auto-expire hoga._`,
+          ].join('\n'));
+          // Auto-cancel after 10 minutes of inactivity
+          setTimeout(() => {
+            if (broadcastSession[senderNum]) {
+              delete broadcastSession[senderNum];
+            }
+          }, 10 * 60 * 1000);
+          break;
+        }
+
+        // ============================================================
+        // /done — finish broadcast and send to everyone (owner DM only)
+        // ============================================================
+        case 'done': {
+          if (isGroup) { await reply(msg, `❌ */done* sirf bot ke DM mein use karo!`); break; }
+          const session = broadcastSession[senderNum];
+          if (!session) {
+            await reply(msg, `❌ Koi active broadcast session nahi hai!\n\n*${dynamicPrefix}broadcast* se start karo.`);
+            break;
+          }
+          if (session.messages.length === 0) {
+            delete broadcastSession[senderNum];
+            await reply(msg, `❌ Koi message capture nahi hua!\n\n*${dynamicPrefix}broadcast* se dobara start karo aur kuch bhejo.`);
+            break;
+          }
+          delete broadcastSession[senderNum];
+
+          // Collect all targets
+          const groupTargets = Object.keys(state.chatStates).filter(id => isJidGroup(id));
+          const dmTargets = (state.knownDmUsers || [])
+            .filter(num => num && num !== senderNum)
+            .map(num => num + '@s.whatsapp.net');
+
+          const totalTargets = groupTargets.length + dmTargets.length;
+          await reply(msg, [
+            `📡 *Broadcasting...*`,
+            ``,
+            `📦 Messages  : *${session.messages.length}*`,
+            `📢 Groups    : *${groupTargets.length}*`,
+            `📩 DM users  : *${dmTargets.length}*`,
+            `🎯 Total     : *${totalTargets}*`,
+            ``,
+            `_Please wait..._`,
+          ].join('\n'));
+
+          // Helper: send one captured message to a target JID
+          async function sendBroadcastMsg(targetJid, item) {
+            try {
+              switch (item.type) {
+                case 'text':
+                  await sock.sendMessage(targetJid, { text: item.payload });
+                  break;
+                case 'image':
+                  await sock.sendMessage(targetJid, { image: item.payload, caption: item.caption || '' });
+                  break;
+                case 'video':
+                  await sock.sendMessage(targetJid, { video: item.payload, caption: item.caption || '', gifPlayback: !!item.gifPlayback });
+                  break;
+                case 'sticker':
+                  await sock.sendMessage(targetJid, { sticker: item.payload });
+                  break;
+                case 'audio':
+                  await sock.sendMessage(targetJid, { audio: item.payload, ptt: !!item.ptt, mimetype: 'audio/ogg; codecs=opus' });
+                  break;
+                case 'document':
+                  await sock.sendMessage(targetJid, { document: item.payload, fileName: item.fileName, mimetype: item.mimetype });
+                  break;
+              }
+            } catch {}
+          }
+
+          let sentCount = 0;
+          let failCount = 0;
+          const allTargets = [...groupTargets, ...dmTargets];
+
+          for (const targetJid of allTargets) {
+            let ok = true;
+            for (const item of session.messages) {
+              try { await sendBroadcastMsg(targetJid, item); await delay(300); }
+              catch { ok = false; }
+            }
+            if (ok) sentCount++; else failCount++;
+            await delay(500); // throttle between targets to avoid WA rate-limits
+          }
+
+          await reply(msg, [
+            `╔══════════════════════╗`,
+            `║  📢  𝗕𝗥𝗢𝗔𝗗𝗖𝗔𝗦𝗧  𝗗𝗢𝗡𝗘  📢  ║`,
+            `╚══════════════════════╝`,
+            ``,
+            `✅ *Broadcast complete!*`,
+            ``,
+            `📦 Messages sent : *${session.messages.length}* per user`,
+            `✅ Delivered to  : *${sentCount}* targets`,
+            failCount > 0 ? `❌ Failed        : *${failCount}* targets` : '',
+            `📢 Groups        : ${groupTargets.length}`,
+            `📩 DM users      : ${dmTargets.length}`,
+          ].filter(Boolean).join('\n'));
+          break;
+        }
 
         // ============================================================
         // GROUP MANAGEMENT
@@ -1935,28 +2292,51 @@ async function onMessage({ messages, type }) {
         // ECONOMY COMMANDS
         // ============================================================
         case 'ocash': {
-          const db = loadOwo();
-          getUser(db, senderNum);
-          await sock.sendMessage(chatId, { text: `👤 @${senderNum}\n\n💰 You Have: *${formatCowoncy(db[senderNum].cash)} coins*`, mentions: [senderJid] });
-          saveOwo(db);
+          getUser(owoDb, senderNum);
+          const u = owoDb[senderNum];
+          await sock.sendMessage(chatId, {
+            text: [
+              `╔══════════════════════╗`,
+              `║  💰  𝗪𝗔𝗟𝗟𝗘𝗧  💰   ║`,
+              `╚══════════════════════╝`,
+              ``,
+              `👤 @${senderNum}`,
+              ``,
+              `🪙 Balance : *${formatCowoncy(u.cash)} coins*`,
+              `☠️ Kills   : ${u.kills || 0}`,
+              `📦 Inv     : ${(u.inv || []).length} items`,
+            ].join('\n'),
+            mentions: [senderJid]
+          }, { quoted: msg });
           break;
         }
 
         case 'odaily': {
-          const db = loadOwo();
-          getUser(db, senderNum);
+          getUser(owoDb, senderNum);
           const now = Date.now();
-          const last = db[senderNum].daily || 0;
+          const last = owoDb[senderNum].daily || 0;
           if (now - last < 86400000) {
             const hrs = Math.floor((86400000-(now-last))/3600000);
-            await reply(msg, `⏳ Daily Already Claimed\n\nCome back in ${hrs}h`);
+            const mins = Math.floor(((86400000-(now-last)) % 3600000) / 60000);
+            await reply(msg, `⏳ *Daily Already Claimed!*\n\n🕐 Come back in *${hrs}h ${mins}m*`);
             break;
           }
           const reward = 500;
-          db[senderNum].cash += reward;
-          db[senderNum].daily = now;
-          saveOwo(db);
-          await reply(msg, `🎁 Here is Your Daily Reward!\n\n+${reward} coins 💰`);
+          owoDb[senderNum].cash += reward;
+          owoDb[senderNum].daily = now;
+          saveOwo();
+          await reply(msg, [
+            `╔══════════════════════╗`,
+            `║  🎁  𝗗𝗔𝗜𝗟𝗬  𝗥𝗘𝗪𝗔𝗥𝗗  🎁  ║`,
+            `╚══════════════════════╝`,
+            ``,
+            `✅ Daily reward claimed!`,
+            ``,
+            `💰 *+${reward} coins*`,
+            `🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+            ``,
+            `_Come back tomorrow for more!_ ⏰`,
+          ].join('\n'));
           break;
         }
 
@@ -1965,50 +2345,91 @@ async function onMessage({ messages, type }) {
           break;
         }
 
-        case 'oflip': {
-          if (!arg) { await reply(msg, "❌ Usage: /oflip <amount>"); break; }
-          const bet = parseInt(arg);
-          if (!bet || bet <= 0) { await reply(msg, "❌ Invalid bet"); break; }
-          const db = loadOwo();
-          getUser(db, senderNum);
-          if (db[senderNum].cash < bet) { await reply(msg, "❌ Not enough coins"); break; }
-          await sock.sendMessage(chatId, { text: `@${senderNum} spent ${bet} coins\n\n🪙 The Coin Spins...`, mentions: [senderNum+"@s.whatsapp.net"] });
-          await delay(900);
-          await sock.sendMessage(chatId, { text: `🪙 Spinning...` });
-          await delay(900);
-          const win = Math.random() < 0.6;
-          const result = Math.random() < 0.5 ? "HEADS" : "TAILS";
-          if (win) { db[senderNum].cash += bet; await sock.sendMessage(chatId, { text: `🪙 ${result}\n\n✨ You won +${bet}!` }); }
-          else { db[senderNum].cash -= bet; await sock.sendMessage(chatId, { text: `🪙 ${result}\n\n🌙 You lost -${bet}` }); }
-          saveOwo(db);
-          break;
-        }
-
+        // ── COIN FLIP (/oflip and /ocf are identical — both fixed) ──────────
+        case 'oflip':
         case 'ocf': {
-          if (!arg) { await reply(msg, "❌ Usage: /ocf <amount>"); break; }
+          if (!arg) {
+            await reply(msg, `❌ *Usage:* ${dynamicPrefix}${command} <amount>\n_Example: ${dynamicPrefix}${command} 500_`);
+            break;
+          }
           const bet = parseInt(arg);
-          if (!bet || bet <= 0) { await reply(msg, "❌ Invalid bet"); break; }
-          const db = loadOwo();
-          getUser(db, senderNum);
-          if (db[senderNum].cash < bet) { await reply(msg, "❌ Not enough coins"); break; }
-          await sock.sendMessage(chatId, { text: `@${senderNum} bet ${bet} coins\n\n🪙 Spinning...`, mentions: [senderNum+"@s.whatsapp.net"] });
+          if (!bet || bet <= 0 || isNaN(bet)) {
+            await reply(msg, `❌ Invalid bet amount! Number dalo.\n_Example: ${dynamicPrefix}${command} 500_`);
+            break;
+          }
+          if (bet < 10) {
+            await reply(msg, `❌ Minimum bet *10 coins* hai!`);
+            break;
+          }
+          getUser(owoDb, senderNum);
+
+          // ── Pre-check: does user have enough coins? ──
+          if (owoDb[senderNum].cash < bet) {
+            await reply(msg, [
+              `❌ *Coins kam hain!*`,
+              ``,
+              `💸 Bet    : *${formatCowoncy(bet)} coins*`,
+              `🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+              ``,
+              `_Pehle ${dynamicPrefix}odaily se coins lo!_`,
+            ].join('\n'));
+            break;
+          }
+
+          // ── Suspense animation ──
+          await sock.sendMessage(chatId, {
+            text: `🪙 *COIN FLIP*\n\n@${senderNum} ne bet lagayi: *${formatCowoncy(bet)} coins*\n\n⟳ _Coin uchhal raha hai..._`,
+            mentions: [senderJid]
+          });
           await delay(900);
-          await sock.sendMessage(chatId, { text: `🪙 Spinning...` });
+          await sock.sendMessage(chatId, { text: `🪙 _Ghoom raha hai..._ ⚡` });
           await delay(900);
-          const win = Math.random() < 0.6;
-          const result = Math.random() < 0.5 ? "HEADS" : "TAILS";
-          if (win) { db[senderNum].cash += bet; await sock.sendMessage(chatId, { text: `🪙 ${result}\n\n✨ You won +${bet}!` }); }
-          else { db[senderNum].cash -= bet; await sock.sendMessage(chatId, { text: `🪙 ${result}\n\n🌙 You lost -${bet}` }); }
-          saveOwo(db);
+
+          // ── FIXED: Re-check balance AFTER delay (atomic update on live DB) ──
+          if (owoDb[senderNum].cash < bet) {
+            await reply(msg, `❌ Balance change ho gaya beech mein! Dobara try karo.`);
+            break;
+          }
+
+          const win = Math.random() < 0.5; // Fair 50/50
+          const face = Math.random() < 0.5 ? '🦅 HEADS' : '🦘 TAILS';
+
+          if (win) {
+            owoDb[senderNum].cash += bet;
+            saveOwo();
+            await sock.sendMessage(chatId, {
+              text: [
+                `🎉 *${face}*`,
+                ``,
+                `✅ @${senderNum} *JEET GAYA!*`,
+                ``,
+                `💰 Won  : *+${formatCowoncy(bet)} coins*`,
+                `🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+              ].join('\n'),
+              mentions: [senderJid]
+            });
+          } else {
+            owoDb[senderNum].cash -= bet;
+            saveOwo();
+            await sock.sendMessage(chatId, {
+              text: [
+                `💀 *${face}*`,
+                ``,
+                `❌ @${senderNum} *HAAR GAYA!*`,
+                ``,
+                `💸 Lost  : *-${formatCowoncy(bet)} coins*`,
+                `🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+              ].join('\n'),
+              mentions: [senderJid]
+            });
+          }
           break;
         }
 
         case 'olb': {
           if (!isGroup) { await reply(msg, "❌ Leaderboard only works in groups"); break; }
-          const db = loadOwo();
           const meta = await sock.groupMetadata(chatId);
           const members = meta.participants;
-          // Build a name map from group participant pushNames (if available)
           const groupNameMap = {};
           members.forEach(p => {
             const num = p.id.split('@')[0];
@@ -2017,33 +2438,36 @@ async function onMessage({ messages, type }) {
           let users = [];
           members.forEach(p => {
             const num = p.id.split("@")[0];
-            if (db[num]) users.push({ id: p.id, num, cash: db[num].cash || 0 });
+            if (owoDb[num]) users.push({ id: p.id, num, cash: owoDb[num].cash || 0 });
           });
           if (!users.length) { await reply(msg, "❌ No players in leaderboard"); break; }
           users.sort((a,b) => b.cash - a.cash);
           const top = users.slice(0, 10);
           const olbMedals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
-          let txt = "🏆 *Group Leaderboard*\n\n";
+          let txt = [
+            `╔══════════════════════╗`,
+            `║  🏆  𝗟𝗘𝗔𝗗𝗘𝗥𝗕𝗢𝗔𝗥𝗗  🏆  ║`,
+            `╚══════════════════════╝`,
+            ``
+          ].join('\n');
           top.forEach((u,i) => {
             const displayName = contactNames[u.num] || groupNameMap[u.num] || `+${u.num}`;
-            txt += `${olbMedals[i]} @${u.num} *(${displayName})* — *${formatCowoncy(u.cash)} coins*\n`;
+            txt += `${olbMedals[i]} @${u.num} *(${displayName})*\n    💰 *${formatCowoncy(u.cash)} coins*\n`;
           });
           await sock.sendMessage(chatId, { text: txt, mentions: top.map(u => u.id) });
           break;
         }
 
         case 'oinv': {
-          const db = loadOwo();
-          getUser(db, senderNum);
-          const inv = db[senderNum].inv;
-          if (!inv.length) { await reply(msg, `🎒 Inventory\n\nempty`); }
-          else { await reply(msg, `🎒 Inventory\n\n${inv.join("\n")}`); }
-          saveOwo(db);
+          getUser(owoDb, senderNum);
+          const inv = owoDb[senderNum].inv;
+          if (!inv.length) { await reply(msg, `🎒 *Inventory*\n\n_Empty — koi items nahi hain_`); }
+          else { await reply(msg, `🎒 *Inventory*\n\n${inv.join("\n")}`); }
           break;
         }
 
         // ============================================================
-        // GIVE COMMAND — Give Money To Replied User
+        // GIVE COMMAND — Give Money To Replied User (FIXED)
         // ============================================================
         case 'give': {
           if (!isGroup) { await reply(msg, "❌ Group only command"); break; }
@@ -2051,27 +2475,57 @@ async function onMessage({ messages, type }) {
           let giveTargetNum = null;
           if (giveCtx?.participant) giveTargetNum = normalizePhoneNumber(giveCtx.participant.split('@')[0]);
           else if (giveCtx?.mentionedJid?.length) giveTargetNum = normalizePhoneNumber(giveCtx.mentionedJid[0].split('@')[0]);
-          if (!giveTargetNum) { await reply(msg, `❌ Usage: Reply to a user and type\n${dynamicPrefix}give <amount>`); break; }
+          if (!giveTargetNum) { await reply(msg, `❌ *Usage:* Kisi ko reply karo phir:\n*${dynamicPrefix}give <amount>*`); break; }
           if (giveTargetNum === senderNum) { await reply(msg, "❌ Apne aap ko coins nahi de sakte!"); break; }
           const giveAmt = parseInt(arg);
-          if (!giveAmt || giveAmt <= 0) { await reply(msg, `❌ Usage: ${dynamicPrefix}give <amount>\nExample: ${dynamicPrefix}give 200`); break; }
-          const dbGive = loadOwo();
-          getUser(dbGive, senderNum); getUser(dbGive, giveTargetNum);
-          if (dbGive[senderNum].cash < giveAmt) { await reply(msg, `❌ Coins kam hain!\nTumhare paas: ${dbGive[senderNum].cash} coins`); break; }
+          if (!giveAmt || giveAmt <= 0 || isNaN(giveAmt)) {
+            await reply(msg, `❌ *Usage:* ${dynamicPrefix}give <amount>\n_Example: ${dynamicPrefix}give 200_`);
+            break;
+          }
+
+          // ── FIXED: Use live in-memory owoDb directly (no race condition) ──
+          getUser(owoDb, senderNum);
+          getUser(owoDb, giveTargetNum);
+
+          if (owoDb[senderNum].cash < giveAmt) {
+            await reply(msg, [
+              `❌ *Coins kam hain!*`,
+              ``,
+              `💸 Amount : *${formatCowoncy(giveAmt)} coins*`,
+              `🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+            ].join('\n'));
+            break;
+          }
+
           const tax = Math.floor(giveAmt * 0.05); // 5% tax
           const received = giveAmt - tax;
-          dbGive[senderNum].cash -= giveAmt;
-          dbGive[giveTargetNum].cash += received;
+          owoDb[senderNum].cash -= giveAmt;
+          owoDb[giveTargetNum].cash += received;
+
           // Tax goes to owner/admin wallet
           if (state.adminNumber) {
             const adminNum = normalizePhoneNumber(state.adminNumber);
-            getUser(dbGive, adminNum);
-            dbGive[adminNum].cash += tax;
+            getUser(owoDb, adminNum);
+            owoDb[adminNum].cash += tax;
           }
-          saveOwo(dbGive);
+          saveOwo(); // Debounced — single write after all changes
+
           const giveTargetJid = giveCtx?.participant || (giveTargetNum + '@s.whatsapp.net');
           await sock.sendMessage(chatId, {
-            text: `💸 *GIVE*\n\n@${senderNum} ne @${giveTargetNum} ko *${giveAmt} coins* diye!\n\n✅ Received: *${received} coins*\n💰 Tax (5%): *${tax} coins* → Owner wallet\n\n💼 Tera balance: ${dbGive[senderNum].cash} coins`,
+            text: [
+              `╔══════════════════════╗`,
+              `║  💸  𝗚𝗜𝗩𝗘  𝗧𝗥𝗔𝗡𝗦𝗙𝗘𝗥  💸  ║`,
+              `╚══════════════════════╝`,
+              ``,
+              `📤 From   : @${senderNum}`,
+              `📥 To     : @${giveTargetNum}`,
+              ``,
+              `💰 Sent   : *${formatCowoncy(giveAmt)} coins*`,
+              `✅ Got    : *${formatCowoncy(received)} coins*`,
+              `💼 Tax(5%): *${formatCowoncy(tax)} coins*`,
+              ``,
+              `🏦 Your balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+            ].join('\n'),
             mentions: [senderJid, giveTargetJid]
           }, { quoted: msg });
           break;
@@ -2081,17 +2535,21 @@ async function onMessage({ messages, type }) {
         // TOP RICH — Top 10 Richest Users
         // ============================================================
         case 'toprich': {
-          const db = loadOwo();
-          const allUsers = Object.entries(db).map(([num, data]) => ({ num, cash: data.cash || 0 }));
+          const allUsers = Object.entries(owoDb).map(([num, data]) => ({ num, cash: data.cash || 0 }));
           allUsers.sort((a,b) => b.cash - a.cash);
           const top = allUsers.slice(0, 10);
           if (!top.length) { await reply(msg, "❌ No users found"); break; }
           const medals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
-          let txt = `💰 *TOP 10 RICHEST USERS*\n\n`;
+          let txt = [
+            `╔══════════════════════╗`,
+            `║  💰  𝗧𝗢𝗣  𝗥𝗜𝗖𝗛𝗘𝗦𝗧  💰  ║`,
+            `╚══════════════════════╝`,
+            ``
+          ].join('\n');
           const topMentions = top.map(u => u.num + "@s.whatsapp.net");
           top.forEach((u,i) => {
             const displayName = contactNames[u.num] ? contactNames[u.num] : `+${u.num}`;
-            txt += `${medals[i]} @${u.num} *(${displayName})* — *${formatCowoncy(u.cash)} coins*\n`;
+            txt += `${medals[i]} @${u.num} *(${displayName})*\n    💰 *${formatCowoncy(u.cash)} coins*\n`;
           });
           await sock.sendMessage(chatId, { text: txt, mentions: topMentions });
           break;
@@ -2101,17 +2559,21 @@ async function onMessage({ messages, type }) {
         // TOP KILL — Top 10 Killers
         // ============================================================
         case 'topkill': {
-          const db = loadOwo();
-          const allUsers = Object.entries(db).map(([num, data]) => ({ num, kills: data.kills || 0 }));
+          const allUsers = Object.entries(owoDb).map(([num, data]) => ({ num, kills: data.kills || 0 }));
           allUsers.sort((a,b) => b.kills - a.kills);
           const top = allUsers.filter(u => u.kills > 0).slice(0, 10);
           if (!top.length) { await reply(msg, "❌ No killers yet — play /bomb to earn kills!"); break; }
           const medals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
-          let txt = `💀 *TOP 10 KILLERS*\n\n`;
+          let txt = [
+            `╔══════════════════════╗`,
+            `║  💀  𝗧𝗢𝗣  𝗞𝗜𝗟𝗟𝗘𝗥𝗦  💀  ║`,
+            `╚══════════════════════╝`,
+            ``
+          ].join('\n');
           const topMentions = top.map(u => u.num + "@s.whatsapp.net");
           top.forEach((u,i) => {
             const displayName = contactNames[u.num] ? contactNames[u.num] : `+${u.num}`;
-            txt += `${medals[i]} @${u.num} *(${displayName})* — *${u.kills} kills* 💣\n`;
+            txt += `${medals[i]} @${u.num} *(${displayName})* — *${u.kills} kills* ☠️\n`;
           });
           await sock.sendMessage(chatId, { text: txt, mentions: topMentions });
           break;
@@ -2121,23 +2583,34 @@ async function onMessage({ messages, type }) {
         // RANK — Check Your Or Friend's Rank
         // ============================================================
         case 'rank': {
-          const db = loadOwo();
           const ctx = msg.message?.extendedTextMessage?.contextInfo;
           let targetNum = senderNum;
           let targetJid = senderJid;
           if (ctx?.participant) { targetNum = normalizePhoneNumber(ctx.participant.split('@')[0]); targetJid = ctx.participant; }
           else if (ctx?.mentionedJid?.length) { targetNum = normalizePhoneNumber(ctx.mentionedJid[0].split('@')[0]); targetJid = ctx.mentionedJid[0]; }
-          getUser(db, targetNum);
-          const allUsers = Object.entries(db).map(([num, data]) => ({ num, cash: data.cash || 0 }));
+          getUser(owoDb, targetNum);
+          const allUsers = Object.entries(owoDb).map(([num, data]) => ({ num, cash: data.cash || 0 }));
           allUsers.sort((a,b) => b.cash - a.cash);
           const rankPos = allUsers.findIndex(u => u.num === targetNum) + 1;
-          const user = db[targetNum];
+          const userRank = owoDb[targetNum];
           const rankEmoji = rankPos === 1 ? '👑' : rankPos <= 3 ? '🏆' : rankPos <= 10 ? '⭐' : '🎮';
           await sock.sendMessage(chatId, {
-            text: `${rankEmoji} *RANK CARD*\n\n👤 @${targetNum}\n\n💰 Coins: *${formatCowoncy(user.cash)}*\n🏅 Rank: *#${rankPos}* of ${allUsers.length}\n💀 Kills: *${user.kills || 0}*\n🎒 Items: *${user.inv.length}*\n💣 Bomb Wins: *${user.bombWins || 0}*`,
+            text: [
+              `╔══════════════════════╗`,
+              `║  ${rankEmoji}  𝗥𝗔𝗡𝗞  𝗖𝗔𝗥𝗗  ${rankEmoji}   ║`,
+              `╚══════════════════════╝`,
+              ``,
+              `👤 @${targetNum}`,
+              ``,
+              `🏅 Rank    : *#${rankPos}* of ${allUsers.length}`,
+              `💰 Coins   : *${formatCowoncy(userRank.cash)}*`,
+              `☠️ Kills   : *${userRank.kills || 0}*`,
+              `🎒 Items   : *${(userRank.inv || []).length}*`,
+              `💣 Bomb Wins: *${userRank.bombWins || 0}*`,
+              `🛡️ Protected: ${userRank.protected && Date.now() < userRank.protected ? `✅ (${Math.ceil((userRank.protected - Date.now())/3600000)}h left)` : '❌'}`,
+            ].join('\n'),
             mentions: [targetJid]
           });
-          saveOwo(db);
           break;
         }
 
@@ -2145,17 +2618,21 @@ async function onMessage({ messages, type }) {
         // LEADERS — Bomb Game Top Leaders
         // ============================================================
         case 'leaders': {
-          const db = loadOwo();
-          const byKills = Object.entries(db).map(([num, data]) => ({ num, kills: data.kills || 0, bombWins: data.bombWins || 0 }));
+          const byKills = Object.entries(owoDb).map(([num, data]) => ({ num, kills: data.kills || 0, bombWins: data.bombWins || 0 }));
           byKills.sort((a,b) => b.kills - a.kills);
           const top = byKills.filter(u => u.kills > 0 || u.bombWins > 0).slice(0, 10);
           if (!top.length) { await reply(msg, "❌ No bomb game leaders yet — play /bomb!"); break; }
           const medals = ['🥇','🥈','🥉','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
-          let txt = `💣 *BOMB GAME LEADERS*\n\n`;
+          let txt = [
+            `╔══════════════════════╗`,
+            `║  💣  𝗕𝗢𝗠𝗕  𝗟𝗘𝗔𝗗𝗘𝗥𝗦  💣  ║`,
+            `╚══════════════════════╝`,
+            ``
+          ].join('\n');
           const topMentions = top.map(u => u.num + "@s.whatsapp.net");
           top.forEach((u,i) => {
             const displayName = contactNames[u.num] ? contactNames[u.num] : `+${u.num}`;
-            txt += `${medals[i]} @${u.num} *(${displayName})* — 💀 ${u.kills} kills | 🏆 ${u.bombWins} wins\n`;
+            txt += `${medals[i]} @${u.num} *(${displayName})*\n    ☠️ ${u.kills} kills | 🏆 ${u.bombWins} wins\n`;
           });
           await sock.sendMessage(chatId, { text: txt, mentions: topMentions });
           break;
@@ -2167,23 +2644,22 @@ async function onMessage({ messages, type }) {
         case 'find': {
           const FIND_COST = 1500;
           const MAX_PK = 10;
-          const dbF = loadOwo();
-          getUser(dbF, senderNum);
-          if (dbF[senderNum].cash < FIND_COST) {
-            await reply(msg, `🔍 *POKÉMON FIND*\n\n❌ Tumhare paas ${FIND_COST} coins nahi hain!\nTumhare paas: *${dbF[senderNum].cash}* 🪙\n\nPehle coins kamao: *${dynamicPrefix}odaily*, *${dynamicPrefix}ofip*, *${dynamicPrefix}ocf*`);
+          getUser(owoDb, senderNum);
+          if (owoDb[senderNum].cash < FIND_COST) {
+            await reply(msg, `🔍 *POKÉMON FIND*\n\n❌ Tumhare paas ${formatCowoncy(FIND_COST)} coins nahi hain!\nTumhare paas: *${formatCowoncy(owoDb[senderNum].cash)}* 🪙\n\nPehle coins kamao: *${dynamicPrefix}odaily*, *${dynamicPrefix}ocf*, *${dynamicPrefix}oflip*`);
             break;
           }
-          if (dbF[senderNum].pokemon.length >= MAX_PK) {
+          if (owoDb[senderNum].pokemon.length >= MAX_PK) {
             await reply(msg, `❌ Tumhara Pokémon bag full hai! (${MAX_PK}/${MAX_PK})\n\n*${dynamicPrefix}warzone* mein battle karo — haare wale ka Pokémon winner ka ho jaata hai aur 0 strength ke saath.`);
             break;
           }
-          dbF[senderNum].cash -= FIND_COST;
+          owoDb[senderNum].cash -= FIND_COST;
           const caught = findRandomPokemon();
-          dbF[senderNum].pokemon.push(caught);
-          const slot = dbF[senderNum].pokemon.length;
-          saveOwo(dbF);
+          owoDb[senderNum].pokemon.push(caught);
+          const slot = owoDb[senderNum].pokemon.length;
+          saveOwo();
           const re = RARITY_EMOJI[caught.rarity];
-          await reply(msg, `╔══════════════════════╗\n║  🔍  𝗣𝗢𝗞É𝗠𝗢𝗡  𝗙𝗢𝗨𝗡𝗗!  🔍  ║\n╚══════════════════════╝\n\n${re} *${caught.name}* (${caught.rarity.toUpperCase()})\n\n🌀 Type    : ${caught.type}\n⚡ Skill   : ${caught.skill}\n💪 Strength: ${caught.currentStr}/${caught.maxStr}\n🎯 Min Lvl : ${caught.minLvl}\n📦 Slot    : #${slot}\n\n💰 Cost: -${FIND_COST} coins\nBal: ${dbF[senderNum].cash} 🪙\n\n_${dynamicPrefix}mypk se apna collection dekho!_`);
+          await reply(msg, `╔══════════════════════╗\n║  🔍  𝗣𝗢𝗞É𝗠𝗢𝗡  𝗙𝗢𝗨𝗡𝗗!  🔍  ║\n╚══════════════════════╝\n\n${re} *${caught.name}* (${caught.rarity.toUpperCase()})\n\n🌀 Type    : ${caught.type}\n⚡ Skill   : ${caught.skill}\n💪 Strength: ${caught.currentStr}/${caught.maxStr}\n🎯 Min Lvl : ${caught.minLvl}\n📦 Slot    : #${slot}\n\n💰 Cost: -${formatCowoncy(FIND_COST)} coins\nBal: ${formatCowoncy(owoDb[senderNum].cash)} 🪙\n\n_${dynamicPrefix}mypk se apna collection dekho!_`);
           break;
         }
 
@@ -2191,10 +2667,9 @@ async function onMessage({ messages, type }) {
         // MYPK — View your Pokémon collection
         // ============================================================
         case 'mypk': {
-          const dbMP = loadOwo();
-          getUser(dbMP, senderNum);
-          const myPks = dbMP[senderNum].pokemon;
-          const myKills = dbMP[senderNum].kills || 0;
+          getUser(owoDb, senderNum);
+          const myPks = owoDb[senderNum].pokemon;
+          const myKills = owoDb[senderNum].kills || 0;
           const myLvl = getLevel(myKills);
           if (!myPks.length) {
             await reply(msg, `🎒 *Tumhara Pokémon bag empty hai!*\n\n🔍 *${dynamicPrefix}find* — 1500 coins mein random Pokémon pakdo\n📋 *${dynamicPrefix}pkdex* — saare available Pokémon dekho\n\n*Tumhara Level: ${myLvl}* (${myKills} kills)`);
@@ -2220,9 +2695,8 @@ async function onMessage({ messages, type }) {
         // MYLVL — Check your trainer level
         // ============================================================
         case 'mylvl': {
-          const dbLV = loadOwo();
-          getUser(dbLV, senderNum);
-          const lvKills = dbLV[senderNum].kills || 0;
+          getUser(owoDb, senderNum);
+          const lvKills = owoDb[senderNum].kills || 0;
           const curLvl = getLevel(lvKills);
           const needed = killsToNextLevel(lvKills);
           let txt = `╔══════════════════════╗\n║  🏅  𝗧𝗥𝗔𝗜𝗡𝗘𝗥  𝗟𝗘𝗩𝗘𝗟  🏅  ║\n╚══════════════════════╝\n\n`;
@@ -2264,9 +2738,8 @@ async function onMessage({ messages, type }) {
         // PKHEAL — Heal a Pokémon's strength (3 coins per str point)
         // ============================================================
         case 'pkheal': {
-          const dbH = loadOwo();
-          getUser(dbH, senderNum);
-          const hPks = dbH[senderNum].pokemon;
+          getUser(owoDb, senderNum);
+          const hPks = owoDb[senderNum].pokemon;
           if (!hPks.length) { await reply(msg, `❌ Koi Pokémon nahi hai! *${dynamicPrefix}find* se pakdo.`); break; }
           const hSlot = parseInt(arg);
           if (!hSlot || hSlot < 1 || hSlot > hPks.length) {
@@ -2280,15 +2753,15 @@ async function onMessage({ messages, type }) {
           }
           const healNeeded = hPk.maxStr - hPk.currentStr;
           const healCost = healNeeded * 3;
-          if (dbH[senderNum].cash < healCost) {
-            await reply(msg, `❌ *${hPk.name}* heal ke liye *${healCost}* coins chahiye!\nTumhare paas: ${dbH[senderNum].cash}🪙\nStrength needed: +${healNeeded}`);
+          if (owoDb[senderNum].cash < healCost) {
+            await reply(msg, `❌ *${hPk.name}* heal ke liye *${formatCowoncy(healCost)}* coins chahiye!\nTumhare paas: ${formatCowoncy(owoDb[senderNum].cash)}🪙\nStrength needed: +${healNeeded}`);
             break;
           }
-          dbH[senderNum].cash -= healCost;
+          owoDb[senderNum].cash -= healCost;
           hPk.currentStr = hPk.maxStr;
-          saveOwo(dbH);
+          saveOwo();
           const re = RARITY_EMOJI[hPk.rarity];
-          await reply(msg, `💊 *POKÉMON HEALED!*\n\n${re} *${hPk.name}*\n💪 Strength: *${hPk.maxStr}/${hPk.maxStr}* ✅\n\n💰 Cost: -${healCost} coins\nBal: ${dbH[senderNum].cash}🪙`);
+          await reply(msg, `💊 *POKÉMON HEALED!*\n\n${re} *${hPk.name}*\n💪 Strength: *${hPk.maxStr}/${hPk.maxStr}* ✅\n\n💰 Cost: -${formatCowoncy(healCost)} coins\nBal: ${formatCowoncy(owoDb[senderNum].cash)}🪙`);
           break;
         }
 
@@ -2298,22 +2771,21 @@ async function onMessage({ messages, type }) {
         case 'warzone': {
           if (!isGroup) { await reply(msg, '❌ Warzone sirf group mein hoti hai!'); break; }
           const wzSlot = parseInt(arg);
-          const dbWZ = loadOwo();
-          getUser(dbWZ, senderNum);
+          getUser(owoDb, senderNum);
           const wzCtx = msg.message?.extendedTextMessage?.contextInfo;
           const wzTargetJid = wzCtx?.participant;
           if (!wzTargetJid) { await reply(msg, `⚔️ Kisi ko *reply* karo phir *${dynamicPrefix}warzone <slot>* likho!\n\nExample: *${dynamicPrefix}warzone 1*`); break; }
           const wzTargetNum = wzTargetJid.split('@')[0];
           if (wzTargetNum === senderNum) { await reply(msg, '❌ Khud se battle nahi kar sakte!'); break; }
           if (warZones[chatId]) { await reply(msg, '⚔️ Is group mein pehle se ek battle chal rahi hai!'); break; }
-          const wzPks = dbWZ[senderNum].pokemon;
+          const wzPks = owoDb[senderNum].pokemon;
           if (!wzPks.length) { await reply(msg, `❌ Tumhare paas koi Pokémon nahi hai!\n🔍 *${dynamicPrefix}find* se pakdo!`); break; }
           if (!wzSlot || wzSlot < 1 || wzSlot > wzPks.length) {
             await reply(msg, `❌ *Usage:* ${dynamicPrefix}warzone <slot>\n\nTumhare Pokémon:\n` + wzPks.map((p,i)=>`${RARITY_EMOJI[p.rarity]} #${i+1} ${p.name} (${p.currentStr}str)`).join('\n'));
             break;
           }
           const wzMyPk = wzPks[wzSlot - 1];
-          const wzMyLvl = getLevel(dbWZ[senderNum].kills || 0);
+          const wzMyLvl = getLevel(owoDb[senderNum].kills || 0);
           if (wzMyLvl < wzMyPk.minLvl) {
             await reply(msg, `❌ *${wzMyPk.name}* use karne ke liye Level *${wzMyPk.minLvl}* chahiye!\nTumhara level: *${wzMyLvl}*\n\n_${dynamicPrefix}kill se level badhaao!_`);
             break;
@@ -2355,21 +2827,20 @@ async function onMessage({ messages, type }) {
           clearTimeout(awPending.timer);
           delete warZones[chatId];
           const awSlot = parseInt(arg);
-          const dbAW = loadOwo();
-          getUser(dbAW, senderNum);
-          getUser(dbAW, awPending.challengerNum);
-          const awMyPks = dbAW[senderNum].pokemon;
+          getUser(owoDb, senderNum);
+          getUser(owoDb, awPending.challengerNum);
+          const awMyPks = owoDb[senderNum].pokemon;
           if (!awMyPks.length) { await reply(msg, `❌ Tumhare paas koi Pokémon nahi! *${dynamicPrefix}find* se pakdo.`); break; }
           if (!awSlot || awSlot < 1 || awSlot > awMyPks.length) {
             await reply(msg, `❌ Sahi slot do: *${dynamicPrefix}acceptwar <slot>*\nTumhare Pokémon:\n` + awMyPks.map((p,i)=>`${RARITY_EMOJI[p.rarity]} #${i+1} ${p.name} (${p.currentStr}str)`).join('\n'));
             break;
           }
           const awMyPk = awMyPks[awSlot - 1];
-          const awMyLvl = getLevel(dbAW[senderNum].kills || 0);
+          const awMyLvl = getLevel(owoDb[senderNum].kills || 0);
           if (awMyLvl < awMyPk.minLvl) { await reply(msg, `❌ *${awMyPk.name}* ke liye Level *${awMyPk.minLvl}* chahiye! Tumhara: ${awMyLvl}`); break; }
           if (awMyPk.currentStr <= 0) { await reply(msg, `❌ *${awMyPk.name}* ki strength 0 hai! Heal karo: *${dynamicPrefix}pkheal ${awSlot}*`); break; }
           // Get challenger's Pokémon
-          const awChalPks = dbAW[awPending.challengerNum].pokemon;
+          const awChalPks = owoDb[awPending.challengerNum].pokemon;
           const awChalPk = awChalPks[awPending.challengerPkIdx];
           if (!awChalPk) { await reply(msg, '❌ Challenger ka Pokémon nahi mila. Battle cancel.'); break; }
           // Compare strengths
@@ -2377,26 +2848,24 @@ async function onMessage({ messages, type }) {
           const myStr = awMyPk.currentStr;
           let winnerNum, loserNum, winnerJid, loserJid, winnerPk, loserPk, loserPkIdx, loserPks;
           if (chalStr >= myStr) {
-            // Challenger wins
             winnerNum = awPending.challengerNum; winnerJid = awPending.challengerJid;
             loserNum  = senderNum;               loserJid  = senderJid;
             winnerPk  = awChalPk;                loserPk   = awMyPk;
-            loserPkIdx = awSlot - 1;             loserPks  = dbAW[senderNum].pokemon;
+            loserPkIdx = awSlot - 1;             loserPks  = owoDb[senderNum].pokemon;
           } else {
-            // Target wins
             winnerNum = senderNum;               winnerJid = senderJid;
             loserNum  = awPending.challengerNum; loserJid  = awPending.challengerJid;
             winnerPk  = awMyPk;                  loserPk   = awChalPk;
-            loserPkIdx = awPending.challengerPkIdx; loserPks = dbAW[awPending.challengerNum].pokemon;
+            loserPkIdx = awPending.challengerPkIdx; loserPks = owoDb[awPending.challengerNum].pokemon;
           }
           // Transfer loser's Pokémon to winner (at 0 strength)
           const capturedPk = { ...loserPk, currentStr: 0 };
           loserPks.splice(loserPkIdx, 1);
-          const winnerPks = dbAW[winnerNum].pokemon;
+          const winnerPks = owoDb[winnerNum].pokemon;
           if (winnerPks.length < 10) winnerPks.push(capturedPk);
           // Award kill to winner
-          dbAW[winnerNum].kills = (dbAW[winnerNum].kills || 0) + 1;
-          saveOwo(dbAW);
+          owoDb[winnerNum].kills = (owoDb[winnerNum].kills || 0) + 1;
+          saveOwo();
           const re1 = RARITY_EMOJI[awChalPk.rarity];
           const re2 = RARITY_EMOJI[awMyPk.rarity];
           const battleLines = [
@@ -2432,16 +2901,15 @@ async function onMessage({ messages, type }) {
             if (!game) return;
             const loser = game.holder;
             const loserNum = loser.split("@")[0];
-            const db = loadOwo();
-            getUser(db, loserNum);
-            db[loserNum].cash = Math.max(0, db[loserNum].cash - game.penalty);
+            getUser(owoDb, loserNum);
+            owoDb[loserNum].cash = Math.max(0, owoDb[loserNum].cash - game.penalty);
             if (game.lastPasser) {
-              getUser(db, game.lastPasser);
-              db[game.lastPasser].kills = (db[game.lastPasser].kills || 0) + 1;
-              db[game.lastPasser].bombWins = (db[game.lastPasser].bombWins || 0) + 1;
+              getUser(owoDb, game.lastPasser);
+              owoDb[game.lastPasser].kills = (owoDb[game.lastPasser].kills || 0) + 1;
+              owoDb[game.lastPasser].bombWins = (owoDb[game.lastPasser].bombWins || 0) + 1;
             }
-            saveOwo(db);
-            let txt = `💥 *BOOM!*\n\n@${loserNum} lost 💰${game.penalty} coins!`;
+            saveOwo();
+            let txt = `💥 *BOOM!*\n\n@${loserNum} lost 💰${formatCowoncy(game.penalty)} coins!`;
             const mentions = [loser];
             if (game.lastPasser) { txt += `\n\n💀 @${game.lastPasser} gets a *KILL*! 🏆`; mentions.push(game.lastPasser + "@s.whatsapp.net"); }
             await sock.sendMessage(chatId, { text: txt, mentions });
@@ -2456,7 +2924,7 @@ async function onMessage({ messages, type }) {
           const puzzle = puzzles[Math.floor(Math.random()*puzzles.length)];
           const reward = 50;
           emojiGames[chatId] = { answer: puzzle.answer, reward };
-          await sock.sendMessage(chatId, { text: `🧩 *GUESS THE WORD*\n\n${puzzle.emoji}\n\n⏱ 30 seconds\n💰 +${reward} coins` });
+          await sock.sendMessage(chatId, { text: `🧩 *GUESS THE WORD*\n\n${puzzle.emoji}\n\n⏱ 30 seconds\n💰 *+${reward} coins*` });
           setTimeout(async () => {
             if (!emojiGames[chatId]) return;
             await sock.sendMessage(chatId, { text: `⏰ Time Up!\n\nAnswer was: *${puzzle.answer}*` });
@@ -2471,7 +2939,7 @@ async function onMessage({ messages, type }) {
           const number = Math.floor(Math.random()*50) + 1;
           const reward = 60;
           guessGames[chatId] = { number, reward };
-          await sock.sendMessage(chatId, { text: `🎯 *GUESS THE NUMBER*\n\nNumber between 1 – 50\n\nFirst correct guess wins!\n💰 +${reward} coins` });
+          await sock.sendMessage(chatId, { text: `🎯 *GUESS THE NUMBER*\n\nNumber between *1 – 50*\n\nFirst correct guess wins!\n💰 *+${reward} coins*` });
           setTimeout(() => { delete guessGames[chatId]; }, 60000);
           break;
         }
@@ -2483,7 +2951,7 @@ async function onMessage({ messages, type }) {
           const scrambled = shuffleWord(word);
           const reward = 45;
           scrambleGames[chatId] = { word, reward };
-          await reply(msg, `🧩 *WORD SCRAMBLE*\n\nUnscramble this word:\n\n*${scrambled}*\n\n💰 +${reward} coins`);
+          await reply(msg, `🧩 *WORD SCRAMBLE*\n\nUnscramble this word:\n\n*${scrambled}*\n\n🏆 First to unscramble wins!\n💰 *+${reward} coins*`);
           setTimeout(() => { delete scrambleGames[chatId]; }, 60000);
           break;
         }
@@ -2496,7 +2964,7 @@ async function onMessage({ messages, type }) {
           const answer = a + b;
           const reward = 40;
           mathGames[chatId] = { answer, reward };
-          await reply(msg, `🧠 *MATH CHALLENGE*\n\nSolve fast:\n\n*${a} + ${b} = ?*\n\n💰 +${reward} coins`);
+          await reply(msg, `🧠 *MATH CHALLENGE*\n\nSolve fast:\n\n*${a} + ${b} = ?*\n\n💰 *+${reward} coins*`);
           setTimeout(() => { delete mathGames[chatId]; }, 60000);
           break;
         }
@@ -2508,7 +2976,7 @@ async function onMessage({ messages, type }) {
           const reward = 50;
           const minTime = Math.ceil(sentence.length / 12 * 1000);
           duelGames[chatId] = { sentence, reward, startTime: Date.now(), minTime };
-          await reply(msg, `🏁 *TYPING RACE*\n\nType This Sentence Fast:\n\n*${sentence}*\n\n🏆 First correct message wins!\n💰 +${reward} coins`);
+          await reply(msg, `🏁 *TYPING RACE*\n\nType This Sentence Fast:\n\n*${sentence}*\n\n🏆 First correct message wins!\n💰 *+${reward} coins*`);
           setTimeout(() => { delete duelGames[chatId]; }, 60000);
           break;
         }
@@ -2543,13 +3011,13 @@ async function onMessage({ messages, type }) {
 `💰 ${p}ocash       — apne coins dekho`,
 `🎁 ${p}odaily      — daily reward lo`,
 `🎒 ${p}oinv        — inventory dekho`,
-`🪙 ${p}ocf <amt>   — coin flip`,
-`🎲 ${p}oflip <amt> — gamble karo`,
-`🏆 ${p}olb         — leaderboard`,
+`🪙 ${p}ocf <amt>   — coin flip (50/50)`,
+`🎲 ${p}oflip <amt> — coin flip (50/50)`,
+`🏆 ${p}olb         — group leaderboard`,
 `💸 ${p}give <amt>  — coins do (reply)`,
 `👑 ${p}toprich     — top 10 ameer`,
 `📊 ${p}rank        — apna rank dekho`,
-`💼 ${p}bal         — balance dekho`,
+`💼 ${p}bal         — balance + stats`,
 ``,
 `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰`,
 `⚔️  𝗕𝗔𝗧𝗧𝗟𝗘  𝗔𝗥𝗘𝗡𝗔`,
@@ -2575,7 +3043,6 @@ async function onMessage({ messages, type }) {
 `💊 ${p}pkheal <n>  — Pokémon heal karo (3🪙/str)`,
 ``,
 `_Levels: ⚪Common Lvl0 🟢Uncommon Lvl3 🔵Rare Lvl6 🌟Legend Lvl12_`,
-`_20 kills = Level 5 | Level kills needed badhtey hain!_`,
 ``,
 `▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰`,
 `🎮  𝗚𝗔𝗠𝗘𝗦`,
@@ -2642,6 +3109,9 @@ async function onMessage({ messages, type }) {
 `🗑️ ${p}removeco    — subadmin hataao`,
 `🔄 ${p}changeprefix — prefix badlo`,
 `🏓 ${p}ping        — bot speed check`,
+`🟢 ${p}kiru on     — bot globally on karo`,
+`🔴 ${p}kiru off    — bot globally off karo`,
+`📢 ${p}broadcast   — mass message bhejo (DM mein)`,
 `📊 ${p}status      — system status`,
 `🎭 ${p}addbotsticker <happy/sad/roast> — mood sticker add`,
 `🗑️ ${p}clearbotsticker [cat] — stickers clear karo`,
@@ -2743,7 +3213,6 @@ async function onMessage({ messages, type }) {
                   await sock.sendMessage(chatId, { image: mediaBuf, caption: actionText, mentions: [targetJid] }, { quoted: msg });
                 }
               } else {
-                // File missing — fall through to legacy sticker
                 throw new Error('file missing');
               }
             } else {
@@ -2860,23 +3329,25 @@ async function onMessage({ messages, type }) {
           const balTargetJid = balCtx?.participant;
           const balNum = balTargetJid ? normalizePhoneNumber(balTargetJid.split('@')[0]) : senderNum;
           const balJid = balTargetJid || senderJid;
-          const dbBal = loadOwo();
-          getUser(dbBal, balNum);
-          const uBal = dbBal[balNum];
+          getUser(owoDb, balNum);
+          const uBal = owoDb[balNum];
           const isDeadBal = uBal.dead === true;
+          const protectedLeft = uBal.protected && Date.now() < uBal.protected
+            ? `✅ (${Math.ceil((uBal.protected - Date.now())/3600000)}h left)` : '❌ No';
           await sock.sendMessage(chatId, {
             text: [
-              isDeadBal ? `💀 *DEAD PROFILE*` : `💰 *BALANCE*`, ``,
-              `👤 User: @${balNum}`,
-              isDeadBal ? `☠️ Status: *💀 DEAD* — Revive karo pehle!` : `🟢 Status: *Alive*`,
-              `🪙 Coins: *${formatCowoncy(uBal.cash)}*`,
-              `☠️ Kills: ${uBal.kills || 0}`,
+              isDeadBal ? `╔══════════════════════╗\n║  💀  𝗗𝗘𝗔𝗗  𝗣𝗥𝗢𝗙𝗜𝗟𝗘  💀  ║\n╚══════════════════════╝`
+                        : `╔══════════════════════╗\n║  💰  𝗕𝗔𝗟𝗔𝗡𝗖𝗘  𝗖𝗔𝗥𝗗  💰  ║\n╚══════════════════════╝`,
+              ``,
+              `👤 User     : @${balNum}`,
+              `🫀 Status   : ${isDeadBal ? '💀 DEAD — revive karo!' : '🟢 Alive'}`,
+              `🪙 Coins    : *${formatCowoncy(uBal.cash)}*`,
+              `☠️ Kills    : ${uBal.kills || 0}`,
               `💣 Bomb Wins: ${uBal.bombWins || 0}`,
-              `🛡️ Protected: ${uBal.protected && Date.now() < uBal.protected ? `Yes (${Math.ceil((uBal.protected - Date.now())/3600000)}h left)` : 'No'}`
+              `🛡️ Protected: ${protectedLeft}`,
             ].join('\n'),
             mentions: [balJid]
           }, { quoted: msg });
-          saveOwo(dbBal);
           break;
         }
 
@@ -2890,23 +3361,30 @@ async function onMessage({ messages, type }) {
           if (robTargetNum === senderNum) { await reply(msg, '😂 Apne aap ko nahi loot sakte!'); break; }
           const robAmt = parseInt(arg);
           if (!robAmt || robAmt <= 0) { await reply(msg, `❌ Usage: ${dynamicPrefix}rob <amount>\nExample: ${dynamicPrefix}rob 200`); break; }
-          const dbRob = loadOwo();
-          getUser(dbRob, senderNum); getUser(dbRob, robTargetNum);
+          getUser(owoDb, senderNum);
+          getUser(owoDb, robTargetNum);
           const robNow = Date.now();
-          if (dbRob[robTargetNum].protected && robNow < dbRob[robTargetNum].protected) {
-            const leftH = Math.ceil((dbRob[robTargetNum].protected - robNow) / 3600000);
+          if (owoDb[robTargetNum].protected && robNow < owoDb[robTargetNum].protected) {
+            const leftH = Math.ceil((owoDb[robTargetNum].protected - robNow) / 3600000);
             await reply(msg, `🛡️ Yeh user protected hai! *${leftH} ghante* aur wait karo.`);
             break;
           }
-          if (dbRob[robTargetNum].cash < robAmt) {
-            await reply(msg, `😅 @${robTargetNum} ke paas sirf *${dbRob[robTargetNum].cash} coins* hain!`);
+          if (owoDb[robTargetNum].cash < robAmt) {
+            await reply(msg, `😅 @${robTargetNum} ke paas sirf *${formatCowoncy(owoDb[robTargetNum].cash)} coins* hain!`);
             break;
           }
-          dbRob[senderNum].cash += robAmt;
-          dbRob[robTargetNum].cash -= robAmt;
-          saveOwo(dbRob);
+          owoDb[senderNum].cash += robAmt;
+          owoDb[robTargetNum].cash -= robAmt;
+          saveOwo();
           await sock.sendMessage(chatId, {
-            text: `🦹 *ROB SUCCESS!*\n\n*${msg.pushName || senderNum}* ne @${robTargetNum} se *${robAmt} coins* chura liye! 💸\n\n💰 Tera balance: ${dbRob[senderNum].cash} coins`,
+            text: [
+              `🦹 *ROB SUCCESS!*`,
+              ``,
+              `*${msg.pushName || senderNum}* ne @${robTargetNum} se coins chura liye!`,
+              ``,
+              `💸 Stolen : *${formatCowoncy(robAmt)} coins*`,
+              `🏦 Balance: *${formatCowoncy(owoDb[senderNum].cash)} coins*`,
+            ].join('\n'),
             mentions: [robTargetJid]
           }, { quoted: msg });
           break;
@@ -2920,34 +3398,30 @@ async function onMessage({ messages, type }) {
           if (!killTargetJid) { await reply(msg, `❌ Kisi ko reply karo phir *${dynamicPrefix}kill* use karo!`); break; }
           const killTargetNum = normalizePhoneNumber(killTargetJid.split('@')[0]);
           if (killTargetNum === senderNum) { await reply(msg, '☠️ Apne aap ko nahi maar sakte! 😅'); break; }
-          const dbKill = loadOwo();
-          getUser(dbKill, senderNum); getUser(dbKill, killTargetNum);
-          // Sender cannot kill if they are dead
-          if (dbKill[senderNum].dead === true) {
+          getUser(owoDb, senderNum);
+          getUser(owoDb, killTargetNum);
+          if (owoDb[senderNum].dead === true) {
             await reply(msg, `💀 Tum khud *DEAD* ho! Pehle apne aap ko *${dynamicPrefix}revive* karo.`);
             break;
           }
-          // Target must be alive to be killed
-          if (dbKill[killTargetNum].dead === true) {
+          if (owoDb[killTargetNum].dead === true) {
             await reply(msg, `💀 @${killTargetNum} pehle se hi dead hai!`);
             break;
           }
-          // Check protection
-          if (dbKill[killTargetNum].protected && Date.now() < dbKill[killTargetNum].protected) {
-            const leftH = Math.ceil((dbKill[killTargetNum].protected - Date.now()) / 3600000);
+          if (owoDb[killTargetNum].protected && Date.now() < owoDb[killTargetNum].protected) {
+            const leftH = Math.ceil((owoDb[killTargetNum].protected - Date.now()) / 3600000);
             await reply(msg, `🛡️ @${killTargetNum} protected hai! *${leftH} ghante* aur wait karo.`);
             break;
           }
-          // Random loot 150–300 coins
           const loot = Math.floor(Math.random() * 151) + 150;
-          dbKill[senderNum].cash += loot;
-          dbKill[senderNum].kills = (dbKill[senderNum].kills || 0) + 1;
-          dbKill[killTargetNum].dead = true; // Target is now DEAD
-          saveOwo(dbKill);
+          owoDb[senderNum].cash += loot;
+          owoDb[senderNum].kills = (owoDb[senderNum].kills || 0) + 1;
+          owoDb[killTargetNum].dead = true;
+          saveOwo();
           const killMsgs = [
-            `⚔️ *KILL!*\n\n*${msg.pushName || senderNum}* ne @${killTargetNum} ko kill kar diya! 💀\n\n💸 Mila: *${loot} coins*\n🏆 Total Kills: ${dbKill[senderNum].kills}\n\n_@${killTargetNum} ab DEAD hai — ${dynamicPrefix}revive se wapas aa sakta hai_`,
-            `🗡️ *HEADSHOT!*\n\n*${msg.pushName || senderNum}* ne @${killTargetNum} ko khatam kar diya! 😵\n\n💸 Mila: *${loot} coins*\n🏆 Total Kills: ${dbKill[senderNum].kills}\n\n_@${killTargetNum} 💀 DEAD — ${dynamicPrefix}revive karo!_`,
-            `🔫 *ELIMINATED!*\n\n@${killTargetNum} mar gaya! *${msg.pushName || senderNum}* ka +1 kill! 💥\n\n💸 Reward: *${loot} coins*\n\n_@${killTargetNum} ab DEAD hai — revive kiye bina kuch nahi kar sakta!_`
+            `⚔️ *KILL!*\n\n*${msg.pushName || senderNum}* ne @${killTargetNum} ko kill kar diya! 💀\n\n💸 Mila: *${formatCowoncy(loot)} coins*\n🏆 Total Kills: ${owoDb[senderNum].kills}\n\n_@${killTargetNum} ab DEAD hai — ${dynamicPrefix}revive se wapas aa sakta hai_`,
+            `🗡️ *HEADSHOT!*\n\n*${msg.pushName || senderNum}* ne @${killTargetNum} ko khatam kar diya! 😵\n\n💸 Mila: *${formatCowoncy(loot)} coins*\n🏆 Total Kills: ${owoDb[senderNum].kills}\n\n_@${killTargetNum} 💀 DEAD — ${dynamicPrefix}revive karo!_`,
+            `🔫 *ELIMINATED!*\n\n@${killTargetNum} mar gaya! *${msg.pushName || senderNum}* ka +1 kill! 💥\n\n💸 Reward: *${formatCowoncy(loot)} coins*\n\n_@${killTargetNum} ab DEAD hai — revive kiye bina kuch nahi kar sakta!_`
           ];
           await sock.sendMessage(chatId, {
             text: randItem(killMsgs),
@@ -2964,33 +3438,30 @@ async function onMessage({ messages, type }) {
           const isSelfRevive = !revTargetJid;
           const revTargetNum = revTargetJid ? normalizePhoneNumber(revTargetJid.split('@')[0]) : senderNum;
           const reviveCost = isSelfRevive ? 500 : 550;
-          const dbRev = loadOwo();
-          getUser(dbRev, senderNum);
-          // Self-revive: must be dead
-          if (isSelfRevive && dbRev[senderNum].dead !== true) {
+          getUser(owoDb, senderNum);
+          if (isSelfRevive && owoDb[senderNum].dead !== true) {
             await reply(msg, '❓ Tum toh alive ho! Koi zaroorat nahi revive ki. 😄');
             break;
           }
-          // Friend revive: target must be dead
           if (!isSelfRevive) {
-            getUser(dbRev, revTargetNum);
-            if (dbRev[revTargetNum].dead !== true) {
+            getUser(owoDb, revTargetNum);
+            if (owoDb[revTargetNum].dead !== true) {
               await reply(msg, `❓ @${revTargetNum} pehle se alive hai!`);
               break;
             }
           }
-          if (dbRev[senderNum].cash < reviveCost) {
-            await reply(msg, `❌ Revive ke liye *${reviveCost} coins* chahiye!\n${isSelfRevive ? '_(Self revive = 500 coins)_' : '_(Friend revive = 550 coins)_'}`);
+          if (owoDb[senderNum].cash < reviveCost) {
+            await reply(msg, `❌ Revive ke liye *${formatCowoncy(reviveCost)} coins* chahiye!\n${isSelfRevive ? '_(Self revive = 500 coins)_' : '_(Friend revive = 550 coins)_'}`);
             break;
           }
-          dbRev[senderNum].cash -= reviveCost;
+          owoDb[senderNum].cash -= reviveCost;
           if (isSelfRevive) {
-            dbRev[senderNum].dead = false; // Self revived
+            owoDb[senderNum].dead = false;
           } else {
-            dbRev[revTargetNum].dead = false; // Friend revived
-            dbRev[revTargetNum].cash += 100;  // Bonus coins for being revived
+            owoDb[revTargetNum].dead = false;
+            owoDb[revTargetNum].cash += 100;
           }
-          saveOwo(dbRev);
+          saveOwo();
           const revMentions = revTargetJid ? [revTargetJid] : [];
           await sock.sendMessage(chatId, {
             text: isSelfRevive
@@ -3004,25 +3475,23 @@ async function onMessage({ messages, type }) {
         // ─── PROTECT ───────────────────────────────────────────────────────
 
         case 'protect': {
-          // Usage: /protect 1d
           const protDur = 24 * 60 * 60 * 1000; // 1 day fixed
           const protCost = 500;
-          const dbProt = loadOwo();
-          getUser(dbProt, senderNum);
-          if (dbProt[senderNum].cash < protCost) {
-            await reply(msg, `🛡️ Protect ke liye *${protCost} coins* chahiye!\n\nUsage: *${dynamicPrefix}protect 1d*`);
+          getUser(owoDb, senderNum);
+          if (owoDb[senderNum].cash < protCost) {
+            await reply(msg, `🛡️ Protect ke liye *${formatCowoncy(protCost)} coins* chahiye!\n\nUsage: *${dynamicPrefix}protect 1d*`);
             break;
           }
           const protNow = Date.now();
-          if (dbProt[senderNum].protected && protNow < dbProt[senderNum].protected) {
-            const leftH = Math.ceil((dbProt[senderNum].protected - protNow) / 3600000);
+          if (owoDb[senderNum].protected && protNow < owoDb[senderNum].protected) {
+            const leftH = Math.ceil((owoDb[senderNum].protected - protNow) / 3600000);
             await reply(msg, `🛡️ Already protected ho! *${leftH} ghante* baaki hain.`);
             break;
           }
-          dbProt[senderNum].cash -= protCost;
-          dbProt[senderNum].protected = protNow + protDur;
-          saveOwo(dbProt);
-          await reply(msg, `🛡️ *PROTECTED!*\n\n*${msg.pushName || senderNum}* 24 ghante ke liye rob & kill se safe ho gaye!\n\n💰 -${protCost} coins\n⏰ Expires: ${new Date(protNow + protDur).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
+          owoDb[senderNum].cash -= protCost;
+          owoDb[senderNum].protected = protNow + protDur;
+          saveOwo();
+          await reply(msg, `🛡️ *PROTECTED!*\n\n*${msg.pushName || senderNum}* 24 ghante ke liye rob & kill se safe ho gaye!\n\n💰 -${formatCowoncy(protCost)} coins\n⏰ Expires: ${new Date(protNow + protDur).toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
           break;
         }
 
@@ -3041,12 +3510,11 @@ async function onMessage({ messages, type }) {
           if (fineRaw === '' || isNaN(fineAmt) || fineAmt < 0) {
             await reply(msg, `❌ Amount sahi daalo!\nExample: *${dynamicPrefix}fine 100000*`); break;
           }
-          const dbFine = loadOwo();
-          getUser(dbFine, fineTgtNum);
-          const fineBefore = dbFine[fineTgtNum].cash;
-          dbFine[fineTgtNum].cash = fineAmt === 0 ? 0 : Math.max(0, dbFine[fineTgtNum].cash - fineAmt);
-          const fineAfter = dbFine[fineTgtNum].cash;
-          saveOwo(dbFine);
+          getUser(owoDb, fineTgtNum);
+          const fineBefore = owoDb[fineTgtNum].cash;
+          owoDb[fineTgtNum].cash = fineAmt === 0 ? 0 : Math.max(0, owoDb[fineTgtNum].cash - fineAmt);
+          const fineAfter = owoDb[fineTgtNum].cash;
+          saveOwo();
           const fineName = contactNames[fineTgtNum] || `+${fineTgtNum}`;
           await sock.sendMessage(chatId, {
             text: `⚖️ *FINE ISSUED!*\n\n👤 @${fineTgtNum} *(${fineName})*\n💸 Fine   : *${fineAmt === 0 ? 'BALANCE ZEROED' : formatCowoncy(fineAmt) + ' coins'}*\n\n📊 Before : ${formatCowoncy(fineBefore)} coins\n📊 After  : *${formatCowoncy(fineAfter)} coins*\n\n🛡️ Shield bypassed — no mercy 😏`,
@@ -3069,14 +3537,14 @@ async function onMessage({ messages, type }) {
           const trToNum   = normalizePhoneNumber(trToJid.split(':')[0].split('@')[0]);
           const trAmt = parseInt(arg);
           if (!trAmt || trAmt <= 0) { await reply(msg, '❌ Amount sahi daalo!'); break; }
-          const dbTr = loadOwo();
-          getUser(dbTr, trFromNum); getUser(dbTr, trToNum);
-          if (dbTr[trFromNum].cash < trAmt) {
-            await reply(msg, `❌ @${trFromNum} ke paas sirf *${formatCowoncy(dbTr[trFromNum].cash)} coins* hain!`); break;
+          getUser(owoDb, trFromNum);
+          getUser(owoDb, trToNum);
+          if (owoDb[trFromNum].cash < trAmt) {
+            await reply(msg, `❌ @${trFromNum} ke paas sirf *${formatCowoncy(owoDb[trFromNum].cash)} coins* hain!`); break;
           }
-          dbTr[trFromNum].cash -= trAmt;
-          dbTr[trToNum].cash   += trAmt;
-          saveOwo(dbTr);
+          owoDb[trFromNum].cash -= trAmt;
+          owoDb[trToNum].cash   += trAmt;
+          saveOwo();
           await sock.sendMessage(chatId, {
             text: `💸 *TRANSFER COMPLETE!*\n\n📤 From : @${trFromNum}\n📥 To   : @${trToNum}\n💰 Amount: *${formatCowoncy(trAmt)} coins*\n\n🔒 Admin transfer — no limits, no questions 😌`,
             mentions: [trFromJid, trToJid]
@@ -3139,20 +3607,17 @@ async function onMessage({ messages, type }) {
           const sDbCbs = loadStickerDb();
           let cbsDeleted = 0;
           if (validCbsCats.includes(cbsCat)) {
-            // Clear one category
             const slots = sDbCbs[cbsCat] || [];
             for (const slot of slots) { try { fs.unlinkSync(path.join(__dirname, 'stickers', slot.file)); cbsDeleted++; } catch {} }
             sDbCbs[cbsCat] = [];
             saveStickerDb(sDbCbs);
             await reply(msg, `🗑️ *${cbsCat.toUpperCase()} Stickers Cleared!*\n\nDeleted: ${cbsDeleted} sticker(s)\n\n_${dynamicPrefix}addbotsticker ${cbsCat} se nayi add karo!_`);
           } else {
-            // Clear all categories
             for (const cat of validCbsCats) {
               const slots = sDbCbs[cat] || [];
               for (const slot of slots) { try { fs.unlinkSync(path.join(__dirname, 'stickers', slot.file)); cbsDeleted++; } catch {} }
               sDbCbs[cat] = [];
             }
-            // Also clear legacy daily
             for (const slot of (sDbCbs.daily || [])) { try { fs.unlinkSync(path.join(__dirname, 'stickers', slot.file)); cbsDeleted++; } catch {} }
             sDbCbs.daily = [];
             saveStickerDb(sDbCbs);
@@ -3167,13 +3632,13 @@ async function onMessage({ messages, type }) {
           if (!senderIsAdmin && !senderIsBotSelf) { await reply(msg, '❌ Sirf bot owner use kar sakta hai!'); break; }
           try {
             await reply(msg, '📦 _Data export ho raha hai... wait karo!_');
-            const db = loadOwo();
-            const totalUsers = Object.keys(db).length;
-            const aliveCount = Object.values(db).filter(u => !u.dead).length;
-            const deadCount = Object.values(db).filter(u => u.dead).length;
-            const richest = Object.entries(db).sort((a,b) => (b[1].cash||0)-(a[1].cash||0))[0];
-            const statsCaption = `╔══════════════════════╗\n║  ⚔️  𝐊𝐈𝐑𝐔 𝐁𝐎𝐓 — DATA  ⚔️  ║\n╚══════════════════════╝\n\n📦 *Data Export Complete!*\n\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n👥 Total Users  : ${totalUsers}\n🟢 Alive        : ${aliveCount}\n💀 Dead         : ${deadCount}\n👑 Richest      : ${richest ? `+${richest[0]} (${richest[1].cash||0}🪙)` : 'N/A'}\n\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n📁 *Files Sent:*\n• owo_db.json (economy data)\n• sticker_db.json (sticker config)\n\n_VPS shift ke liye yeh files apne naye folder mein daal do — data safe rahega!_ ✅`;
-            // Send owo_db.json as document (no zip binary needed)
+            const totalUsers = Object.keys(owoDb).length;
+            const aliveCount = Object.values(owoDb).filter(u => !u.dead).length;
+            const deadCount = Object.values(owoDb).filter(u => u.dead).length;
+            const richest = Object.entries(owoDb).sort((a,b) => (b[1].cash||0)-(a[1].cash||0))[0];
+            const statsCaption = `╔══════════════════════╗\n║  ⚔️  𝐊𝐈𝐑𝐔 𝐁𝐎𝐓 — DATA  ⚔️  ║\n╚══════════════════════╝\n\n📦 *Data Export Complete!*\n\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n👥 Total Users  : ${totalUsers}\n🟢 Alive        : ${aliveCount}\n💀 Dead         : ${deadCount}\n👑 Richest      : ${richest ? `+${richest[0]} (${formatCowoncy(richest[1].cash||0)}🪙)` : 'N/A'}\n\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n📁 *Files Sent:*\n• owo_db.json (economy data)\n• sticker_db.json (sticker config)\n\n_VPS shift ke liye yeh files apne naye folder mein daal do — data safe rahega!_ ✅`;
+            // Force a synchronous write before sending (so file is up-to-date)
+            try { fs.writeFileSync(OWO_FILE, JSON.stringify(owoDb, null, 2)); } catch {}
             if (fs.existsSync(OWO_FILE)) {
               const owoBuf = fs.readFileSync(OWO_FILE);
               await sock.sendMessage(chatId, {
@@ -3185,7 +3650,6 @@ async function onMessage({ messages, type }) {
             } else {
               await reply(msg, statsCaption + '\n\n⚠️ owo_db.json nahi mila!');
             }
-            // Send sticker_db.json as a second document
             if (fs.existsSync(STICKER_DB_FILE)) {
               const stickerBuf = fs.readFileSync(STICKER_DB_FILE);
               await sock.sendMessage(chatId, {
@@ -3216,7 +3680,6 @@ async function onMessage({ messages, type }) {
             await reply(msg, `❌ Pehle ek sticker/GIF/image *reply* karo phir *${dynamicPrefix}setsticker ${targetActionCmd}* likho!`);
             break;
           }
-          // Detect media type from quoted message
           let sMediaType = null;
           let sExt = null;
           let sGifPlayback = false;
@@ -3230,14 +3693,12 @@ async function onMessage({ messages, type }) {
             await reply(msg, '❌ Sirf *sticker*, *GIF*, ya *image* reply karo!');
             break;
           }
-          // Check slot limit
           const sDb = loadStickerDb();
           if (!sDb[targetActionCmd]) sDb[targetActionCmd] = [];
           if (sDb[targetActionCmd].length >= 5) {
             await reply(msg, `❌ *${targetActionCmd}* ke liye already *5 slots* bhar gaye hain!\n\nPehle reset karo: *${dynamicPrefix}clearstickers ${targetActionCmd}*`);
             break;
           }
-          // Download the media
           try {
             const fakeMsg = {
               key: { remoteJid: chatId, id: sCtx.stanzaId, fromMe: false, participant: sCtx.participant || sCtx.quotedParticipant },
@@ -3247,7 +3708,6 @@ async function onMessage({ messages, type }) {
               logger: pino({ level: 'silent' }),
               reuploadRequest: sock.updateMediaMessage
             });
-            // Ensure stickers folder exists
             const stickerDir = path.join(__dirname, 'stickers');
             if (!fs.existsSync(stickerDir)) fs.mkdirSync(stickerDir, { recursive: true });
             const slotIdx = sDb[targetActionCmd].length + 1;
@@ -3276,7 +3736,6 @@ async function onMessage({ messages, type }) {
           }
           const csDb = loadStickerDb();
           const csSlots = csDb[csCmd] || [];
-          // Delete files
           let deleted = 0;
           for (const slot of csSlots) {
             try { fs.unlinkSync(path.join(__dirname, 'stickers', slot.file)); deleted++; } catch {}
@@ -3304,20 +3763,18 @@ async function onMessage({ messages, type }) {
             await reply(msg, `⚔️ Is group mein pehle se ek war chal rahi hai! Pehle usse khatam karo.`);
             break;
           }
-          const warDb = loadOwo();
-          getUser(warDb, senderNum);
-          getUser(warDb, warTargetNum);
-          if (warDb[senderNum].dead) { await reply(msg, `☠️ Tum mare ho! Pehle *${dynamicPrefix}revive* karo!`); break; }
-          if (warDb[warTargetNum].dead) { await reply(msg, `☠️ Opponent already dead hai! Kisi aur ko challenge karo.`); break; }
-          if (warDb[senderNum].cash < warBet) {
-            await reply(msg, `⚔️ Itne coins nahi hain! Tumhare paas: *${warDb[senderNum].cash}* 🪙`);
+          getUser(owoDb, senderNum);
+          getUser(owoDb, warTargetNum);
+          if (owoDb[senderNum].dead) { await reply(msg, `☠️ Tum mare ho! Pehle *${dynamicPrefix}revive* karo!`); break; }
+          if (owoDb[warTargetNum].dead) { await reply(msg, `☠️ Opponent already dead hai! Kisi aur ko challenge karo.`); break; }
+          if (owoDb[senderNum].cash < warBet) {
+            await reply(msg, `⚔️ Itne coins nahi hain! Tumhare paas: *${formatCowoncy(owoDb[senderNum].cash)}* 🪙`);
             break;
           }
-          if (warDb[warTargetNum].cash < warBet) {
-            await reply(msg, `⚔️ Opponent ke paas itne coins nahi hain! Unke paas: *${warDb[warTargetNum].cash}* 🪙`);
+          if (owoDb[warTargetNum].cash < warBet) {
+            await reply(msg, `⚔️ Opponent ke paas itne coins nahi hain! Unke paas: *${formatCowoncy(owoDb[warTargetNum].cash)}* 🪙`);
             break;
           }
-          // Set up challenge with 60s timeout
           const warTimer = setTimeout(async () => {
             if (warChallenges[chatId] && warChallenges[chatId].challenger === senderNum) {
               delete warChallenges[chatId];
@@ -3337,7 +3794,7 @@ async function onMessage({ messages, type }) {
             timer: warTimer
           };
           await sock.sendMessage(chatId, {
-            text: `╔══════════════════════╗\n║  ⚔️   𝐖𝐀𝐑  𝐂𝐇𝐀𝐋𝐋𝐄𝐍𝐆𝐄   ⚔️  ║\n╚══════════════════════╝\n\n⚔️ @${senderNum} ne @${warTargetNum} ko BATTLE ke liye challenge kiya!\n\n🪙 Bet Amount : *${warBet} coins*\n🏆 Winner Gets: *${warBet * 2} coins*\n\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n@${warTargetNum} — Accept karoge?\nType *${dynamicPrefix}accept* to fight! ⚔️\n\n⏰ 60 seconds mein accept karo!`,
+            text: `╔══════════════════════╗\n║  ⚔️   𝐖𝐀𝐑  𝐂𝐇𝐀𝐋𝐋𝐄𝐍𝐆𝐄   ⚔️  ║\n╚══════════════════════╝\n\n⚔️ @${senderNum} ne @${warTargetNum} ko BATTLE ke liye challenge kiya!\n\n🪙 Bet Amount : *${formatCowoncy(warBet)} coins*\n🏆 Winner Gets: *${formatCowoncy(warBet * 2)} coins*\n\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n@${warTargetNum} — Accept karoge?\nType *${dynamicPrefix}accept* to fight! ⚔️\n\n⏰ 60 seconds mein accept karo!`,
             mentions: [senderJid, warTargetJid]
           }, { quoted: msg });
           break;
@@ -3351,25 +3808,22 @@ async function onMessage({ messages, type }) {
             await reply(msg, `⚔️ Yeh challenge tumhare liye nahi hai! @${warPending.target} ka challenge hai.`);
             break;
           }
-          // Cancel timeout
           clearTimeout(warPending.timer);
           delete warChallenges[chatId];
-          // Load DB and deduct bets from both
-          const warFightDb = loadOwo();
-          getUser(warFightDb, warPending.challenger);
-          getUser(warFightDb, warPending.target);
+          getUser(owoDb, warPending.challenger);
+          getUser(owoDb, warPending.target);
           // Re-verify both have enough coins
-          if (warFightDb[warPending.challenger].cash < warPending.bet) {
+          if (owoDb[warPending.challenger].cash < warPending.bet) {
             await sock.sendMessage(chatId, { text: `❌ War cancel! @${warPending.challenger} ke paas ab enough coins nahi hain!`, mentions: [warPending.challengerJid] });
             break;
           }
-          if (warFightDb[warPending.target].cash < warPending.bet) {
+          if (owoDb[warPending.target].cash < warPending.bet) {
             await reply(msg, `❌ War cancel! Tumhare paas enough coins nahi hain!`);
             break;
           }
           // Deduct bet from both
-          warFightDb[warPending.challenger].cash -= warPending.bet;
-          warFightDb[warPending.target].cash -= warPending.bet;
+          owoDb[warPending.challenger].cash -= warPending.bet;
+          owoDb[warPending.target].cash -= warPending.bet;
           // Determine winner randomly
           const challengerWins = Math.random() < 0.5;
           const winnerNum  = challengerWins ? warPending.challenger  : warPending.target;
@@ -3378,12 +3832,10 @@ async function onMessage({ messages, type }) {
           const loserNum   = challengerWins ? warPending.target  : warPending.challenger;
           const loserJid   = challengerWins ? warPending.targetJid : warPending.challengerJid;
           const prize = warPending.bet * 2;
-          warFightDb[winnerNum].cash += prize;
-          // Kill loser, award kill to winner
-          warFightDb[loserNum].dead = true;
-          warFightDb[winnerNum].kills = (warFightDb[winnerNum].kills || 0) + 1;
-          saveOwo(warFightDb);
-          // Build dramatic battle sequence
+          owoDb[winnerNum].cash += prize;
+          owoDb[loserNum].dead = true;
+          owoDb[winnerNum].kills = (owoDb[winnerNum].kills || 0) + 1;
+          saveOwo();
           const moves = [
             `⚔️ @${warPending.challenger} lunges forward with a fierce strike!`,
             `🛡️ @${warPending.target} blocks and counters with fury!`,
@@ -3393,7 +3845,7 @@ async function onMessage({ messages, type }) {
           ];
           const battleLog = moves.join('\n') + `\n\n`;
           await sock.sendMessage(chatId, {
-            text: `╔══════════════════════╗\n║  ⚔️   𝐁𝐀𝐓𝐓𝐋𝐄  𝐒𝐓𝐀𝐑𝐓𝐒   ⚔️ ║\n╚══════════════════════╝\n\n${battleLog}🏆 *WINNER: @${winnerNum}* 🏆\n\n💀 @${loserNum} is DEAD!\n\n🪙 Prize: *+${prize} coins* to @${winnerNum}\n💀 Kill count +1 for @${winnerNum}\n\n_Use ${dynamicPrefix}revive to come back!_`,
+            text: `╔══════════════════════╗\n║  ⚔️   𝐁𝐀𝐓𝐓𝐋𝐄  𝐒𝐓𝐀𝐑𝐓𝐒   ⚔️ ║\n╚══════════════════════╝\n\n${battleLog}🏆 *WINNER: @${winnerNum}* 🏆\n\n💀 @${loserNum} is DEAD!\n\n🪙 Prize: *+${formatCowoncy(prize)} coins* to @${winnerNum}\n💀 Kill count +1 for @${winnerNum}\n\n_Use ${dynamicPrefix}revive to come back!_`,
             mentions: [winnerJid, loserJid]
           }, { quoted: msg });
           break;
