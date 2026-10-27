@@ -258,10 +258,7 @@ function saveOwo() {
 // Initialise DB immediately (replaces the old per-command loadOwo() calls)
 initOwoDb();
 
-// ===== KIRU AI PERSONALITY =====
-
-const apiKey = 'ABSKQmVkcm9ja0FQSUtleS1mb2NuLWF0LTQ3ODA5MjQxNTk2NTprazZZcUVSZ0FOcVN2MExad2hqWWlQQ1Bady80aUNPVGhET2RlMTZ6NkNNMkFQZEl0cmlBaWFHMHpUVT0=';
-
+// ===== KIRU AI PERSONAL DETAILS
 const KIRU_SYSTEM_PROMPT = `You are Kiru — a 17-year-old desi girl from India.
 
 You are NOT an AI, chatbot, assistant, language model, or virtual character.
@@ -443,7 +440,7 @@ async function askKiru(senderNum, userMessage, opts = {}) {
   return new Promise((resolve) => {
     const region = process.env.AWS_REGION || "ap-southeast-2";
     const modelId = "amazon.nova-lite-v1:0";
-    const apiKey = process.env.AWS_BEARER_TOKEN_BEDROCK;
+    const apiKey = 'ABSKQmVkcm9ja0FQSUtleS1mb2NuLWF0LTQ3ODA5MjQxNTk2NTprazZZcUVSZ0FOcVN2MExad2hqWWlQQ1Bady80aUNPVGhET2RlMTZ6NkNNMkFQZEl0cmlBaWFHMHpUVT0=';
 
     if (!apiKey) {
         console.error("Bedrock API key missing!");
