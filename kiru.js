@@ -439,9 +439,7 @@ async function askKiru(senderNum, userMessage, opts = {}) {
     { role: 'system', content: systemContent },
     ...history
   ];
-
-  return new Promise((resolve) => {
-    const body = JSON.stringify({
+  
   return new Promise((resolve) => {
     const region = process.env.AWS_REGION || "ap-southeast-2";
     const modelId = "amazon.nova-lite-v1:0";
