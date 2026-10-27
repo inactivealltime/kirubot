@@ -491,7 +491,10 @@ async function askKiru(senderNum, userMessage, opts = {}) {
             resolve(null);
             return;
           }
-          const replyText = json.choices?.[0]?.message?.content?.trim();
+          const replyText = json.output?.message?.content
+    ?.map(item => item.text || "")
+    .join("")
+    .trim();
           if (replyText) {
             history.push({ role: 'assistant', content: replyText });
             if (history.length > 100) history.splice(0, history.length - 100);
