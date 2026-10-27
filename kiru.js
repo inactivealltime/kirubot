@@ -260,7 +260,7 @@ initOwoDb();
 
 // ===== KIRU AI PERSONALITY =====
 
-const GROQ_API_KEY = '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';
+const apiKey = 'ABSKQmVkcm9ja0FQSUtleS1mb2NuLWF0LTQ3ODA5MjQxNTk2NTprazZZcUVSZ0FOcVN2MExad2hqWWlQQ1Bady80aUNPVGhET2RlMTZ6NkNNMkFQZEl0cmlBaWFHMHpUVT0=';
 
 const KIRU_SYSTEM_PROMPT = `You are Kiru — a 17-year-old desi girl from India.
 
@@ -442,24 +442,46 @@ async function askKiru(senderNum, userMessage, opts = {}) {
 
   return new Promise((resolve) => {
     const body = JSON.stringify({
-        model: "openai/gpt-oss-120b",
-        messages,
-        temperature: 1,
-        max_completion_tokens: 2048,
-        top_p: 1,
-        reasoning_effort: "medium",
-        stream: false
+  return new Promise((resolve) => {
+    const region = process.env.AWS_REGION || "ap-southeast-2";
+    const modelId = "amazon.nova-lite-v1:0";
+    const apiKey = process.env.AWS_BEARER_TOKEN_BEDROCK;
+
+    if (!apiKey) {
+        console.error("Bedrock API key missing!");
+        return resolve("Bedrock API key configure nahi hai.");
+    }
+
+    const systemMessage = messages.find(m => m.role === "system");
+
+    const chatMessages = messages
+        .filter(m => m.role === "user" || m.role === "assistant")
+        .map(m => ({
+            role: m.role,
+            content: [{ text: String(m.content ?? "") }]
+        }));
+
+    const body = JSON.stringify({
+        messages: chatMessages,
+        ...(systemMessage
+            ? { system: [{ text: String(systemMessage.content ?? "") }] }
+            : {}),
+        inferenceConfig: {
+            maxTokens: 1024,
+            temperature: 0.8,
+            topP: 0.9
+        }
     });
 
     const bodyBuffer = Buffer.from(body, "utf8");
 
     const options = {
-        hostname: "api.groq.com",
-        path: "/openai/v1/chat/completions",
+        hostname: `bedrock-runtime.${region}.amazonaws.com`,
+        path: `/model/${encodeURIComponent(modelId)}/converse`,
         method: "POST",
         headers: {
             "Content-Type": "application/json",
-          "Authorization": `Bearer ${GROQ_API_KEY}`,
+            "Authorization": `Bearer ${apiKey}`,
             "Content-Length": bodyBuffer.length
         }
     };
