@@ -519,7 +519,6 @@ async function askKiru(senderNum, userMessage, opts = {}) {
     }
   });
 });
-    });
     req.on('error', (e) => { console.error('Kiru request error:', e.message); resolve(null); });
     req.setTimeout(15000, () => { req.destroy(); console.error('Kiru timeout'); resolve(null); });
     req.write(bodyBuffer);
