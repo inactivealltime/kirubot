@@ -481,31 +481,44 @@ async function askKiru(senderNum, userMessage, opts = {}) {
         }
     };
     const req = https.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const json = JSON.parse(data);
-          if (json.error) {
-            console.error('Kiru API error:', json.error.message || json.error);
-            resolve(null);
-            return;
-          }
-          const replyText = json.output?.message?.content
-    ?.map(item => item.text || "")
-    .join("")
-    .trim();
-          if (replyText) {
-            history.push({ role: 'assistant', content: replyText });
-            if (history.length > 100) history.splice(0, history.length - 100);
-            saveKiruMemory();
-          }
-          resolve(replyText || null);
-        } catch (e) {
-          console.error('Kiru parse error:', e.message, '| raw:', data.substring(0, 200));
-          resolve(null);
+  let data = '';
+
+  res.on('data', chunk => {
+    data += chunk;
+  });
+
+  res.on('end', () => {
+    try {
+      const json = JSON.parse(data);
+
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        console.error('Kiru Bedrock API error:', res.statusCode, json);
+        resolve(null);
+        return;
+      }
+
+      const replyText = json.output?.message?.content
+        ?.map(item => item.text || '')
+        .join('')
+        .trim();
+
+      if (replyText) {
+        history.push({ role: 'assistant', content: replyText });
+
+        if (history.length > 100) {
+          history.splice(0, history.length - 100);
         }
-      });
+
+        saveKiruMemory();
+      }
+
+      resolve(replyText || null);
+    } catch (e) {
+      console.error('Kiru parse error:', e.message, '| raw:', data.substring(0, 200));
+      resolve(null);
+    }
+  });
+});
     });
     req.on('error', (e) => { console.error('Kiru request error:', e.message); resolve(null); });
     req.setTimeout(15000, () => { req.destroy(); console.error('Kiru timeout'); resolve(null); });
