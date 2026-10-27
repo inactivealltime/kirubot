@@ -260,7 +260,7 @@ initOwoDb();
 
 // ===== KIRU AI PERSONALITY =====
 
-const OPENAI_API_KEY = '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';
+const GROQ_API_KEY = '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';
 
 const KIRU_SYSTEM_PROMPT = `You are Kiru — a 17-year-old desi girl from India.
 
@@ -442,22 +442,26 @@ async function askKiru(senderNum, userMessage, opts = {}) {
 
   return new Promise((resolve) => {
     const body = JSON.stringify({
-      model: 'qwen/qwen3.5-397b-a17b',
-      messages,
-      max_tokens: 100,
-      temperature: 0.88,
-      top_p: 0.9
+        model: "openai/gpt-oss-120b",
+        messages,
+        temperature: 1,
+        max_completion_tokens: 2048,
+        top_p: 1,
+        reasoning_effort: "medium",
+        stream: false
     });
-    const bodyBuffer = Buffer.from(body, 'utf8');
+
+    const bodyBuffer = Buffer.from(body, "utf8");
+
     const options = {
-      hostname: 'integrate.api.nvidia.com',
-      path: '/v1/chat/completions',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENAI_API_KEY}`,
-        'Content-Length': bodyBuffer.length
-      }
+        hostname: "api.groq.com",
+        path: "/openai/v1/chat/completions",
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+          "Authorization": `Bearer ${GROQ_API_KEY}`,
+            "Content-Length": bodyBuffer.length
+        }
     };
     const req = https.request(options, (res) => {
       let data = '';
